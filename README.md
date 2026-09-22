@@ -8,9 +8,23 @@ own C++ codebase — this README's [Roadmap](#roadmap-toward-btcdogelitecoin-lev
 section is the honest list of what heavier infrastructure would still need to
 be added to actually get there.
 
-This is its own project, separate from the `trading-platform` repo it lives
-alongside on the same machine — O-Coin isn't tracked in that repo, and
-shouldn't be.
+This is its own project, separate from the platform it lives alongside —
+O-Coin isn't tracked in that repo, and shouldn't be.
+
+## Where it is used
+
+O-Coin is the tipping currency on **[NEXUS](https://nexuspolydex.com)**
+(<https://nexuspolydex.com>), a market workspace for crypto traders: charts,
+recorded order flow, indicators people write themselves, and calls kept on
+the record. Tipping there is non-custodial — wallet keys are generated in
+the browser and the site relays transactions that are already signed, using
+this chain and these nodes.
+
+There is a [block explorer](https://nexuspolydex.com/app/explorer), a
+[whitepaper](https://nexuspolydex.com/app/whitepaper) and a
+[mining guide](https://nexuspolydex.com/app/mining) there. None of it is
+required to use the chain: everything below runs against the public nodes
+without an account anywhere.
 
 ## Quick start
 
