@@ -37,4 +37,4 @@ jobs:
       # The BFT suites are excluded from CI v1 because the py_ecc fallback makes
       # them minutes-slow; compileall still guards their syntax.)
       - name: In-memory chain/pool test suites
-        run: python -m unittest test_amm_pools test_stake_pool test_pool_history
+        run: python -m unittest test_amm_pools test_stake_pool test_pool_history test_security_hardening

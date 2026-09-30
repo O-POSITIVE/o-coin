@@ -9,7 +9,7 @@ Deliberately built lean rather than as a fork of Bitcoin/Dogecoin/Litecoin's
 own C++ codebase (see O-coin/README.md for the full reasoning and the
 roadmap toward that heavier infrastructure later) — no real P2P discovery
 protocol yet (node.py's /nodes/register + /nodes/resolve are a genuine
-"longest valid chain wins" consensus implementation, just without
+"most-work valid chain wins" consensus implementation, just without
 automatic peer discovery — peers are added by hand for now); real Scrypt
 mining IS implemented (see Block.compute_hash), same algorithm and same
 real parameters Litecoin/Dogecoin use, not a placeholder.
@@ -38,11 +38,12 @@ answer to "cheap, fast, efficient, secure":
 """
 import hashlib
 import json
+import math
 import time
 
 from pow_hash import header_fields_to_hash
 
-from transaction import Transaction
+from transaction import Transaction, is_real_number
 
 
 class Block:
@@ -181,6 +182,12 @@ class Blockchain:
     # already uses to choose what to include. ~25 min of backlog at the ~50-tx,
     # 15s block cadence, so it never bites legitimate use.
     MEMPOOL_MAX = 5000
+    # How far below zero float rounding may leave a balance before a block
+    # is refused for overspending it (security review, 2026-09-29). Amounts
+    # are floats, and "send the whole balance" can land a hair under zero
+    # depending on the order the pieces were added; a billionth of a coin is
+    # far below anything spendable and far above any rounding error.
+    BALANCE_EPSILON = 1e-9
 
     # ── Emission curve — smooth EXPONENTIAL decay toward a permanent
     # floor, not Bitcoin/Dogecoin-style discrete halving and not a
@@ -378,7 +385,7 @@ class Blockchain:
         self.chain = []
         self.mempool = []  # list[Transaction] waiting to be mined
         self.current_target = self.INITIAL_TARGET
-        self.pos_target = 2 ** 256 // (self.TARGET_BLOCK_TIME * max(1, self.GENESIS_PREMINE_AMOUNT))
+        self.pos_target = self._initial_pos_target()
         # ── BFT finality attachment (DORMANT) ──────────────────────────
         # index -> block hash the BFT finality gadget (bft_finality.py) has
         # cryptographically finalized. This is the ADDITIVE finality layer's
@@ -392,7 +399,12 @@ class Blockchain:
         # dormant-until-activated shape as the TX_SCHEMA hard fork.
         self.bft_finalized = {}
         self._create_genesis_block()
+        self.genesis_hash = self.chain[0].compute_hash()
         self._rebuild_balance_index()
+
+    @classmethod
+    def _initial_pos_target(cls):
+        return 2 ** 256 // (cls.TARGET_BLOCK_TIME * max(1, cls.GENESIS_PREMINE_AMOUNT))
 
     def _create_genesis_block(self):
         premine_tx = Transaction(
@@ -411,6 +423,23 @@ class Blockchain:
     def _retarget_ratio(actual_time, expected_time, max_adjustment_factor):
         ratio = actual_time / expected_time
         return max(1 / max_adjustment_factor, min(max_adjustment_factor, ratio))
+
+    @classmethod
+    def _next_target(cls, target, window_start_ts, window_end_ts, interval, max_target):
+        """One retarget step, shared by the live path (_maybe_retarget,
+        _maybe_retarget_pos) and the from-scratch replay in _walk_chain, so
+        the two can never compute different targets for the same history."""
+        actual_time = max(1, window_end_ts - window_start_ts)
+        expected_time = cls.TARGET_BLOCK_TIME * interval
+        ratio = cls._retarget_ratio(actual_time, expected_time, cls.MAX_ADJUSTMENT_FACTOR)
+        return min(int(target * ratio), max_target)
+
+    @staticmethod
+    def block_work(target):
+        """Expected hashes to find a block at this target -- Bitcoin's
+        "chainwork". Summed over a chain, it is what fork choice compares
+        (see replace_chain): a chain of many EASY blocks is long but light."""
+        return 2 ** 256 // (target + 1)
 
     def _maybe_retarget(self):
         """Called right after a PoW block is accepted. Every
@@ -435,11 +464,8 @@ class Blockchain:
             return
         window_start = pow_blocks[-1 - self.RETARGET_INTERVAL]
         window_end = pow_blocks[-1]
-        actual_time = max(1, window_end.timestamp - window_start.timestamp)
-        expected_time = self.TARGET_BLOCK_TIME * self.RETARGET_INTERVAL
-        ratio = self._retarget_ratio(actual_time, expected_time, self.MAX_ADJUSTMENT_FACTOR)
-        new_target = int(self.current_target * ratio)
-        self.current_target = min(new_target, self.MAX_TARGET)
+        self.current_target = self._next_target(self.current_target, window_start.timestamp, window_end.timestamp,
+                                                self.RETARGET_INTERVAL, self.MAX_TARGET)
 
     def _maybe_retarget_pos(self):
         """PoS's own fully independent difficulty retarget — same
@@ -455,11 +481,8 @@ class Blockchain:
             return
         window_start = pos_blocks[-self.POS_RETARGET_INTERVAL]
         window_end = pos_blocks[-1]
-        actual_time = max(1, window_end.timestamp - window_start.timestamp)
-        expected_time = self.TARGET_BLOCK_TIME * self.POS_RETARGET_INTERVAL
-        ratio = self._retarget_ratio(actual_time, expected_time, self.MAX_ADJUSTMENT_FACTOR)
-        new_target = int(self.pos_target * ratio)
-        self.pos_target = min(new_target, self.POS_MAX_TARGET)
+        self.pos_target = self._next_target(self.pos_target, window_start.timestamp, window_end.timestamp,
+                                            self.POS_RETARGET_INTERVAL, self.POS_MAX_TARGET)
 
     # ── Mempool / transactions ────────────────────────────────────────
     # Track A, Phase A2/A3: reject any op-bearing transaction before this
@@ -570,6 +593,11 @@ class Blockchain:
         submitted directly by a miner/peer)."""
         if tx.op not in Blockchain.KNOWN_OPS:
             raise ValueError(f"Unknown transaction op: {tx.op}")
+        # A list or string here would raise AttributeError from the .get()
+        # calls below -- not the ValueError every caller treats as "reject"
+        # -- and take the request, or a peer's chain check, down with it.
+        if tx.op_data is not None and not isinstance(tx.op_data, dict):
+            raise ValueError("op_data must be an object")
         if tx.op == "transfer_asset":
             asset_id = (tx.op_data or {}).get("asset_id") if tx.op_data else None
             if not isinstance(asset_id, str) or not asset_id:
@@ -595,9 +623,9 @@ class Blockchain:
                 raise ValueError("pool_add_liquidity must send to the pool's own derived address")
             amount_a = (tx.op_data or {}).get("amount_a")
             amount_b = (tx.op_data or {}).get("amount_b")
-            if not isinstance(amount_a, (int, float)) or isinstance(amount_a, bool) or amount_a <= 0:
+            if not is_real_number(amount_a) or amount_a <= 0:
                 raise ValueError("pool_add_liquidity requires op_data.amount_a > 0")
-            if not isinstance(amount_b, (int, float)) or isinstance(amount_b, bool) or amount_b <= 0:
+            if not is_real_number(amount_b) or amount_b <= 0:
                 raise ValueError("pool_add_liquidity requires op_data.amount_b > 0")
         elif tx.op == "pool_swap":
             pool_key = (tx.op_data or {}).get("pool_key")
@@ -607,10 +635,10 @@ class Blockchain:
             if asset_in not in (asset_a, asset_b):
                 raise ValueError(f"pool_swap op_data.asset_in must be one of the pool's two assets ({asset_a}, {asset_b})")
             amount_in = (tx.op_data or {}).get("amount_in")
-            if not isinstance(amount_in, (int, float)) or isinstance(amount_in, bool) or amount_in <= 0:
+            if not is_real_number(amount_in) or amount_in <= 0:
                 raise ValueError("pool_swap requires op_data.amount_in > 0")
             min_amount_out = (tx.op_data or {}).get("min_amount_out", 0)
-            if not isinstance(min_amount_out, (int, float)) or isinstance(min_amount_out, bool) or min_amount_out < 0:
+            if not is_real_number(min_amount_out) or min_amount_out < 0:
                 raise ValueError("pool_swap op_data.min_amount_out must be a number >= 0")
             if tx.recipient != tx.sender:
                 raise ValueError("pool_swap redeems to the sender's own address — recipient must equal sender")
@@ -618,7 +646,7 @@ class Blockchain:
             pool_key = (tx.op_data or {}).get("pool_key")
             Blockchain._validate_pool_key(pool_key)
             lp_amount = (tx.op_data or {}).get("lp_amount")
-            if not isinstance(lp_amount, (int, float)) or isinstance(lp_amount, bool) or lp_amount <= 0:
+            if not is_real_number(lp_amount) or lp_amount <= 0:
                 raise ValueError("pool_remove_liquidity requires op_data.lp_amount > 0")
             if tx.recipient != tx.sender:
                 raise ValueError("pool_remove_liquidity redeems to the sender's own address — recipient must equal sender")
@@ -1058,6 +1086,48 @@ class Blockchain:
         self.mempool.append(tx)
         return tx.hash()
 
+    def _select_includable(self, max_transactions):
+        """Which pending transactions a new block can carry, in the order it
+        must carry them. Highest fee first, but only a transaction that
+        applies cleanly ON TOP OF the ones already chosen -- the same in-order
+        check accept_block now makes. The mempool admits a spend of coins
+        that are themselves still pending (it previews every pending tx in
+        arrival order), and pure fee order could put that spend AHEAD of the
+        transfer paying for it; the block would then fail its own node's
+        check and every template after it would too, because the tx never
+        leaves the mempool. So a tx that cannot apply yet is retried after
+        the rest (its funding may come later in the same pass), and one that
+        still cannot is left out -- of this block, not of the mempool.
+        Coinbase is not counted as funding: conservative, and it keeps the
+        choice independent of who is paid."""
+        from collections import ChainMap
+        balances, supply = dict(self.balances), dict(self.asset_supply)
+        pending = sorted(self.mempool, key=lambda t: t.fee, reverse=True)
+        chosen = []
+        progress = True
+        while progress and pending and len(chosen) < max_transactions:
+            progress, deferred = False, []
+            for tx in pending:
+                if len(chosen) >= max_transactions:
+                    break
+                trial_b, trial_s = ChainMap({}, balances), ChainMap({}, supply)
+                try:
+                    if tx.op is not None:
+                        self._validate_op(tx)
+                    debited = self._apply_transaction_to_balance_dict(trial_b, tx, trial_s)
+                except ValueError:
+                    deferred.append(tx)
+                    continue
+                if any(trial_b.get(k, 0) < -self.BALANCE_EPSILON for k in debited):
+                    deferred.append(tx)
+                    continue
+                balances.update(trial_b.maps[0])
+                supply.update(trial_s.maps[0])
+                chosen.append(tx)
+                progress = True
+            pending = deferred
+        return chosen
+
     # ── Mining ───────────────────────────────────────────────────────
     def build_candidate_block(self, miner_address, max_transactions=50):
         """A 'block template' — everything a miner needs to start
@@ -1078,7 +1148,7 @@ class Blockchain:
         real chains incentivize miners to keep including transactions
         even as the block reward itself shrinks over a chain's lifetime.
         """
-        included = sorted(self.mempool, key=lambda t: t.fee, reverse=True)[:max_transactions]
+        included = self._select_includable(max_transactions)
         total_fees = sum(t.fee for t in included)
         block_reward = self.reward_at_height(self.latest_block.index + 1)
         reward_tx = Transaction(sender="0", recipient=miner_address, amount=block_reward + total_fees, fee=0)
@@ -1112,7 +1182,7 @@ class Blockchain:
         units perfectly."""
         if not shares:
             raise ValueError("build_pool_block requires a non-empty shares tally")
-        included = sorted(self.mempool, key=lambda t: t.fee, reverse=True)[:max_transactions]
+        included = self._select_includable(max_transactions)
         total_fees = sum(t.fee for t in included)
         total_reward = self.reward_at_height(self.latest_block.index + 1) + total_fees
         total_shares = sum(shares.values())
@@ -1170,7 +1240,7 @@ class Blockchain:
         weight = self.stake_weight_of(staker_address)
         if weight < 1:
             raise ValueError(f"{staker_address} has no stakeable balance (needs at least 1 whole O-Coin)")
-        included = sorted(self.mempool, key=lambda t: t.fee, reverse=True)[:max_transactions]
+        included = self._select_includable(max_transactions)
         total_fees = sum(t.fee for t in included)
         stake_reward = round(self.reward_at_height(self.latest_block.index + 1) * self.POS_REWARD_FRACTION, 6)
         reward_tx = Transaction(sender="0", recipient=staker_address, amount=stake_reward + total_fees, fee=0)
@@ -1235,6 +1305,47 @@ class Blockchain:
         if kernel_int >= block.target * weight:
             raise ValueError("Stake kernel hash does not meet the PoS difficulty target for this staker's weight")
 
+    def _check_block_balances(self, transactions, balances, asset_supply):
+        """Applies a block's transactions IN ORDER to the passed-in dicts
+        (the caller's throwaway copies) and raises ValueError the moment a
+        signed transaction takes any balance it debits below zero. Shared by
+        accept_block and _walk_chain so a block and a whole chain are judged
+        by the same rule. Coinbase entries are applied too (a miner may
+        spend its own reward later in the same block) but never judged:
+        they debit nothing."""
+        for tx in transactions:
+            if tx.op is not None:
+                self._validate_op(tx)
+            debited_keys = self._apply_transaction_to_balance_dict(balances, tx, asset_supply)
+            if tx.sender == "0":
+                continue
+            for key in debited_keys:
+                if balances.get(key, 0) < -self.BALANCE_EPSILON:
+                    addr, asset = key
+                    raise ValueError(f"Block contains a transaction that would drive {addr}'s {asset} balance negative")
+
+    @staticmethod
+    def _validate_header_fields(block: Block):
+        """The header's own fields must be the types the rules assume
+        (security review, 2026-09-29). A NaN timestamp compares False with
+        everything, so it slipped through both timestamp checks and then
+        poisoned every median and retarget after it; a float or out-of-range
+        target makes the work arithmetic meaningless. Every live block was
+        scanned before this was added and passes."""
+        if not (isinstance(block.index, int) and not isinstance(block.index, bool) and block.index >= 0):
+            raise ValueError("Block index must be a non-negative integer")
+        if not (isinstance(block.timestamp, (int, float)) and not isinstance(block.timestamp, bool)
+                and math.isfinite(block.timestamp) and block.timestamp >= 0):
+            raise ValueError("Block timestamp must be a real, finite number")
+        if not (isinstance(block.target, int) and not isinstance(block.target, bool) and 0 < block.target < 2 ** 256):
+            raise ValueError("Block target must be an integer between 1 and 2**256 - 1")
+        if not (isinstance(block.nonce, int) and not isinstance(block.nonce, bool)):
+            raise ValueError("Block nonce must be an integer")
+        if block.staker_address is not None and not isinstance(block.staker_address, str):
+            raise ValueError("Block staker_address must be a string")
+        if not isinstance(block.transactions, list) or not all(isinstance(tx, Transaction) for tx in block.transactions):
+            raise ValueError("Block transactions must be a list of transactions")
+
     def accept_block(self, block: Block):
         """Validates and appends a block that was mined OR staked
         elsewhere (by node.py's /mining/submit, its staking thread, or
@@ -1247,6 +1358,7 @@ class Blockchain:
         unconditionally, for every block from any source — mined,
         staked, submitted by an external miner, or received from a peer
         during sync."""
+        self._validate_header_fields(block)
         if block.previous_hash != self.latest_block.compute_hash():
             raise ValueError("Block does not build on the current chain tip (someone else's block won the race, or this one is stale)")
         if block.index != self.latest_block.index + 1:
@@ -1300,35 +1412,21 @@ class Blockchain:
         for tx in block.transactions:
             if not tx.is_valid():
                 raise ValueError(f"Block contains an invalid transaction: {tx.hash()}")
-        # Track A, Phase A2/A3: op-bearing transactions get their OWN
-        # block-level invariant checks — unlike OCN transfers (whose balance
-        # sufficiency is ONLY ever checked at mempool-admission time, a
-        # pre-existing, deliberately out-of-scope gap for A1/A2/A3 — see
-        # docs/07-onchain-dex-plan.md's ground constraints), a new asset type
-        # has no such inherited coverage, so a malicious block could
-        # otherwise manufacture spends against a balance that was never
-        # really there. Checked against a running copy seeded from the
-        # currently-indexed balances (not self.balances itself — this block
-        # isn't appended yet) so multiple ops from the same sender within
-        # one block are checked cumulatively against each other, not just
-        # independently against pre-block state.
         op_txs = [tx for tx in block.transactions if tx.op is not None]
-        if op_txs:
-            if block.index < self.TX_SCHEMA_ACTIVATION_HEIGHT:
-                raise ValueError(f"Block contains op-bearing transactions before activation height {self.TX_SCHEMA_ACTIVATION_HEIGHT}")
-            # Validated on a throwaway copy — self.balances/self.asset_supply
-            # only get their REAL update below, once, uniformly for every
-            # transaction in the block (op or not), so this can never
-            # double-apply an op transaction's effects.
-            scratch_balances = dict(self.balances)
-            scratch_supply = dict(self.asset_supply)
-            for tx in op_txs:
-                self._validate_op(tx)
-                debited_keys = self._apply_transaction_to_balance_dict(scratch_balances, tx, scratch_supply)
-                for key in debited_keys:
-                    if scratch_balances.get(key, 0) < 0:
-                        addr, asset = key
-                        raise ValueError(f"Block contains an op transaction that would drive {addr}'s {asset} balance negative")
+        if op_txs and block.index < self.TX_SCHEMA_ACTIVATION_HEIGHT:
+            raise ValueError(f"Block contains op-bearing transactions before activation height {self.TX_SCHEMA_ACTIVATION_HEIGHT}")
+        # Balance sufficiency for EVERY signed transaction, in block order
+        # (security review, 2026-09-29). This used to cover op-bearing
+        # transactions only: a plain OCN transfer's balance was checked at
+        # mempool admission and nowhere else, so a block arriving directly --
+        # from anyone mining one, via /mining/submit or /blocks/receive --
+        # could spend a balance that was never there: an unlimited mint. The
+        # live chain was scanned before this was added and no historical
+        # transaction ever overdrew, so the rule applies at every height.
+        # In order, on a throwaway copy, so several spends from one sender in
+        # one block are checked against each other; self.balances only gets
+        # its REAL update below, once, so nothing is ever applied twice.
+        self._check_block_balances(block.transactions, dict(self.balances), dict(self.asset_supply))
         self.chain.append(block)
         # O(1) incremental update — the common case, a full rebuild would
         # be wasteful here since only this one block's worth of
@@ -1348,119 +1446,159 @@ class Blockchain:
 
     # ── Validation / consensus (the "secure" lever) ─────────────────
     def is_chain_valid(self, chain=None):
-        """Re-derives every block's hash from scratch and checks the
-        whole chain links together correctly and every block meets ITS
-        OWN recorded proof-of-work target — this is the function that
-        makes the whole thing trustworthy without trusting whoever's node
-        you're talking to: anyone can run this against any claimed chain
-        and get the same true/false answer, using nothing but math. This
-        is what node.py's /nodes/resolve calls before ever adopting a
-        peer's claimed chain — a malicious or buggy peer can SEND
-        whatever it wants, it just can't get an invalid chain ACCEPTED.
-        Retargeting history is deliberately NOT re-simulated here (that
-        would mean replaying _maybe_retarget/_maybe_retarget_pos
-        block-by-block to confirm every historical target was the
-        "correct" one for its era) — a real, well-scoped next step (see
-        the README roadmap), but every block's own target is still
-        independently checked against its own hash (PoW) or kernel
-        (PoS), which is the part that actually prevents tampering with
-        past blocks. Reward correctness IS fully re-checked here (unlike
-        target history) — a chain that mints itself extra O-Coin out of
-        nowhere is exactly the kind of thing "independently re-verify
-        from scratch" has to catch, PoS or PoW.
-
-        Note: computing a staked block's stake_weight_of requires
-        walking chain[:i] (this candidate chain's OWN history up to that
-        point, not necessarily self.chain) — for a long chain with many
-        staked blocks this is the one place validation cost grows faster
-        than linear; a real balance-index/UTXO-set would fix that later
-        (see README roadmap) but is out of scope for this lean a v1."""
+        """Re-derives every block's hash from scratch and checks the whole
+        chain links together correctly, every block carries the difficulty
+        target the retarget rules give for that exact point in history, and
+        meets it -- the function that makes the whole thing trustworthy
+        without trusting whoever's node you're talking to: anyone can run
+        this against any claimed chain and get the same true/false answer,
+        using nothing but math. node.py runs it before ever adopting a
+        peer's claimed chain -- a malicious or buggy peer can SEND whatever
+        it wants, it just can't get an invalid chain ACCEPTED. The rules
+        themselves live in _walk_chain; this is its yes/no answer, and a
+        chain too malformed to even inspect is simply "no"."""
         chain = chain if chain is not None else self.chain
-        if not chain or chain[0].previous_hash != "0" * 64:
+        try:
+            self._walk_chain(chain)
+        except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
             return False
-        # Track A, Phase A2/A3: independently re-derived, running balances
-        # for this CANDIDATE chain specifically (never self.balances — this
-        # function must never trust that a candidate ever passed through
-        # accept_block) so op-bearing transactions' block-level invariant
-        # (see accept_block) can be re-checked from scratch here too, the
-        # same "trust nothing, verify everything" standard every other rule
-        # in this function already holds itself to. Maintained incrementally
-        # as the loop below walks the chain in increasing order, one
-        # block's worth of transactions at a time.
-        running_balances = {}
-        running_asset_supply = {}
+        return True
+
+    def _walk_chain(self, chain):
+        """Every rule, block by block from genesis, in ONE linear pass.
+        Raises ValueError on the first failure; on success returns the
+        (PoW, PoS) targets the NEXT block of each kind must carry.
+
+        Security review, 2026-09-29, changed three things here:
+
+        - Historical targets are re-derived, not taken on trust. A block
+          used to be checked only against the target written in its own
+          header, and fork choice was by length, so anyone could serve a
+          long chain of blocks that each named an EASY target and have it
+          win -- rewriting up to CHECKPOINT_DEPTH blocks of history with
+          almost no work. The replay below runs the same _next_target step
+          the live path runs. The whole live chain (14,175 blocks at the
+          time) was replayed before this was added and every block's target
+          matched, so it applies at every height.
+        - Every signed transaction's balance is checked, in block order, not
+          only op-bearing ones (see accept_block).
+        - It is linear. The replay guard used to rebuild the set of every
+          earlier transaction hash for EACH block, and each staked block
+          re-scanned the chain for its staker's weight: quadratic, and a
+          peer could make a node spend minutes on one bad chain. Both are
+          now running state carried forward as the loop walks.
+
+        Stake weight comes from the running balances, i.e. the candidate
+        chain's OWN history up to that block -- never self.balances, since a
+        candidate must be judged without trusting that any of it ever passed
+        through accept_block."""
+        if not chain:
+            raise ValueError("Empty chain")
+        if chain[0].compute_hash() != self.genesis_hash:
+            raise ValueError("Chain does not start from this network's genesis block")
+        balances, supply = {}, {}
         for tx in chain[0].transactions:
-            self._apply_transaction_to_balance_dict(running_balances, tx, running_asset_supply)
+            self._apply_transaction_to_balance_dict(balances, tx, supply)
+        pow_target, pos_target = self.INITIAL_TARGET, self._initial_pos_target()
+        pow_times, pos_times = [chain[0].timestamp], []
+        confirmed = set()
+        prev_hash = self.genesis_hash
         for i in range(1, len(chain)):
             block, prev = chain[i], chain[i - 1]
-            if block.previous_hash != prev.compute_hash():
-                return False
+            self._validate_header_fields(block)
+            if block.previous_hash != prev_hash:
+                raise ValueError(f"Block {i} does not link to the block before it")
             if block.index != prev.index + 1:
-                return False
-            try:
-                self._validate_timestamp(block, chain[:i])
-            except ValueError:
-                return False
+                raise ValueError(f"Block {i} index out of sequence")
+            self._validate_timestamp(block, chain[max(0, i - self.MEDIAN_TIME_WINDOW):i])
+            block_hash = block.compute_hash()
             if block.staker_address is not None:
-                weight = self.stake_weight_of(block.staker_address, chain=chain[:i])
+                if block.target != pos_target:
+                    raise ValueError(f"Block {i} carries a PoS target the retarget rules do not give")
+                weight = int(balances.get((block.staker_address, "OCN"), 0))
                 if weight < 1:
-                    return False
+                    raise ValueError(f"Block {i} staker has no stakeable balance")
                 if int(block.compute_stake_kernel_hash(), 16) >= block.target * weight:
-                    return False
+                    raise ValueError(f"Block {i} stake kernel does not meet its target")
                 block_subsidy = round(self.reward_at_height(block.index) * self.POS_REWARD_FRACTION, 6)
             else:
-                if not block.meets_target():
-                    return False
+                if block.target != pow_target:
+                    raise ValueError(f"Block {i} carries a PoW target the retarget rules do not give")
+                if int(block_hash, 16) >= block.target:
+                    raise ValueError(f"Block {i} hash does not meet its target")
                 block_subsidy = self.reward_at_height(block.index)
             if block.merkle_root != block.compute_merkle_root():
-                return False
+                raise ValueError(f"Block {i} merkle root does not match its transactions")
+            # Before any arithmetic touches their amounts (a NaN must never
+            # reach a sum or a balance).
+            for tx in block.transactions:
+                if not tx.is_valid():
+                    raise ValueError(f"Block {i} contains an invalid transaction")
             reward_txs = [tx for tx in block.transactions if tx.sender == "0"]
             expected_reward = block_subsidy + sum(tx.fee for tx in block.transactions if tx.sender != "0")
             if not reward_txs or abs(sum(tx.amount for tx in reward_txs) - expected_reward) > 1e-6:
-                return False
-            # Same replay guard as accept_block (see that method's
-            # comment for the full reasoning) — re-checked independently
-            # here since is_chain_valid has to catch everything on its
-            # own, from scratch, without trusting that every block ever
-            # passed through accept_block's checks in the first place.
+                raise ValueError(f"Block {i} coinbase does not sum to the reward plus fees")
+            # Same replay guard as accept_block, re-checked independently.
             signed_hashes = [tx.hash() for tx in block.transactions if tx.sender != "0"]
-            if len(signed_hashes) != len(set(signed_hashes)):
-                return False
-            confirmed_hashes = {t.hash() for b in chain[:i] for t in b.transactions if t.sender != "0"}
-            if any(h in confirmed_hashes for h in signed_hashes):
-                return False
-            # Same op/asset-balance invariant accept_block enforces (see
-            # that method's comment for the full reasoning), re-derived
-            # from scratch against running_balances/running_asset_supply as
-            # accumulated up to (but not including) this block. Validated
-            # on a throwaway scratch copy — running_balances/
-            # running_asset_supply only get their REAL update below, once,
-            # uniformly for every transaction in the block, so this can
-            # never double-apply an op transaction's effects.
-            op_txs = [tx for tx in block.transactions if tx.op is not None]
-            if op_txs:
-                if block.index < self.TX_SCHEMA_ACTIVATION_HEIGHT:
-                    return False
-                scratch_balances = dict(running_balances)
-                scratch_supply = dict(running_asset_supply)
-                for tx in op_txs:
-                    try:
-                        self._validate_op(tx)
-                        # pool_swap can raise for a state-dependent reason
-                        # (slippage) that _validate_op alone can't see —
-                        # same try/except needed here.
-                        debited_keys = self._apply_transaction_to_balance_dict(scratch_balances, tx, scratch_supply)
-                    except ValueError:
-                        return False
-                    for key in debited_keys:
-                        if scratch_balances.get(key, 0) < 0:
-                            return False
-            for tx in block.transactions:
-                self._apply_transaction_to_balance_dict(running_balances, tx, running_asset_supply)
-            for tx in block.transactions:
-                if not tx.is_valid():
-                    return False
-        return True
+            if len(signed_hashes) != len(set(signed_hashes)) or any(h in confirmed for h in signed_hashes):
+                raise ValueError(f"Block {i} replays a signed transaction")
+            if block.index < self.TX_SCHEMA_ACTIVATION_HEIGHT and any(tx.op is not None for tx in block.transactions):
+                raise ValueError(f"Block {i} contains op-bearing transactions before activation height")
+            # Checked on a copy; the running state takes the block only once
+            # it has passed.
+            scratch_balances, scratch_supply = dict(balances), dict(supply)
+            self._check_block_balances(block.transactions, scratch_balances, scratch_supply)
+            balances, supply = scratch_balances, scratch_supply
+            confirmed.update(signed_hashes)
+            prev_hash = block_hash
+            if block.staker_address is not None:
+                pos_times.append(block.timestamp)
+                n = len(pos_times)
+                if n >= self.POS_RETARGET_INTERVAL and n % self.POS_RETARGET_INTERVAL == 0:
+                    pos_target = self._next_target(pos_target, pos_times[-self.POS_RETARGET_INTERVAL], pos_times[-1],
+                                                   self.POS_RETARGET_INTERVAL, self.POS_MAX_TARGET)
+            else:
+                pow_times.append(block.timestamp)
+                n = len(pow_times) - 1  # PoW blocks so far, excluding genesis -- as _maybe_retarget counts
+                if n >= self.RETARGET_INTERVAL and n % self.RETARGET_INTERVAL == 0:
+                    pow_target = self._next_target(pow_target, pow_times[-1 - self.RETARGET_INTERVAL], pow_times[-1],
+                                                   self.RETARGET_INTERVAL, self.MAX_TARGET)
+        return pow_target, pos_target
+
+    def chain_work(self, chain):
+        """Total work a chain represents: each PoW block's block_work, and
+        each staked block counted as one block at the PoW difficulty in force
+        just before it (the most recent PoW block's target). A staked block
+        is no harder to make than its stake allows, so it gets no MORE weight
+        than an ordinary block; counting it as one keeps fork choice where it
+        was for staked blocks while PoW blocks are weighed by real work.
+        Reads targets as written -- only meaningful for a chain that
+        _walk_chain has confirmed (or is about to confirm) carries the
+        targets the rules give."""
+        total = 0
+        last_pow_work = self.block_work(chain[0].target) if chain else 0
+        for block in chain[1:]:
+            if block.staker_address is None:
+                last_pow_work = self.block_work(block.target)
+            total += last_pow_work
+        return total
+
+    def adopt_chain(self, chain):
+        """Validate a whole chain from genesis and make it this node's --
+        used for the startup chain (node.py load_chain) and by replace_chain.
+        Raises ValueError if it is not valid. The next targets come from the
+        replay, not from the last block's header: a chain whose last PoW
+        block closed a retarget window already owes its next block the NEW
+        target, and reading the old one back used to leave the node mining
+        against a stale difficulty until the next window."""
+        try:
+            pow_target, pos_target = self._walk_chain(chain)
+        except (TypeError, KeyError, AttributeError, OverflowError) as e:
+            raise ValueError(f"Malformed chain: {e}")
+        self.chain = chain
+        self._rebuild_balance_index()
+        self.current_target, self.pos_target = pow_target, pos_target
+        self.mempool = []  # conservative: a reorg can invalidate assumptions about what's still pending
 
     def _diverges_before_checkpoint(self, candidate_chain):
         """True if candidate_chain disagrees with our own history at or
@@ -1510,40 +1648,34 @@ class Blockchain:
         return False
 
     def replace_chain(self, candidate_chain):
-        """The 'longest valid chain wins' consensus rule every PoW chain
-        uses to resolve disagreement between nodes — EXCEPT past the
-        checkpoint boundary, where "longest and valid" is no longer
-        enough; it also has to agree with what we've already checkpointed
-        (the depth checkpoint always, plus — once the BFT finality gadget is
-        active — any cryptographically-finalized block).
+        """Fork choice: the valid chain with the MOST WORK wins (Bitcoin's
+        rule), EXCEPT past the checkpoint boundary, where it also has to
+        agree with what we've already checkpointed (the depth checkpoint
+        always, plus -- once the BFT finality gadget is active -- any
+        cryptographically-finalized block). This used to be "the longest
+        valid chain", which with unverified historical targets let a long
+        chain of easy blocks beat a shorter chain of real work (security
+        review, 2026-09-29). The candidate needs STRICTLY more work, so a
+        tie keeps the chain we already have.
         Returns True if the candidate replaced our chain, False if it was
-        rejected (shorter, invalid, or attempting to rewrite checkpointed
+        rejected (lighter, invalid, or attempting to rewrite checkpointed
         or BFT-finalized history)."""
-        if len(candidate_chain) <= len(self.chain):
+        try:
+            # Cheapest check first: no hashing at all. Its answer is trusted
+            # only because adopt_chain below re-derives every target.
+            if self.chain_work(candidate_chain) <= self.chain_work(self.chain):
+                return False
+        except (TypeError, AttributeError):
             return False
         if self._diverges_before_checkpoint(candidate_chain):
             return False
         if self.bft_finalized and self._conflicts_with_bft_finality(candidate_chain):
             return False
-        if not self.is_chain_valid(candidate_chain):
+        try:
+            self.adopt_chain(candidate_chain)
+        except ValueError:
             return False
-        self.chain = candidate_chain
-        self._rebuild_balance_index()
-        # The chain's last block might be either type — its own .target
-        # only tells us ONE of current_target/pos_target, never both, so
-        # each needs to be picked up from the last block of ITS OWN kind
-        # instead of blindly reading candidate_chain[-1].target (which
-        # would silently corrupt whichever difficulty didn't just produce
-        # the tip block).
-        last_pow = next((b for b in reversed(candidate_chain) if b.staker_address is None), None)
-        last_pos = next((b for b in reversed(candidate_chain) if b.staker_address is not None), None)
-        if last_pow is not None:
-            self.current_target = last_pow.target
-        if last_pos is not None:
-            self.pos_target = last_pos.target
-        self.mempool = []  # conservative: a reorg can invalidate assumptions about what's still pending
         return True
-
 
 # Self-check, run once at import time: catches the single most likely
 # emission-curve tuning mistake — changing ANNUAL_DECAY_PERCENT or

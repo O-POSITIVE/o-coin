@@ -112,7 +112,7 @@ node — they run heavy work inline and real mining/staking never need them
 | `wallet.py` | A key pair + address (`sha256(pubkey)[:40]`). Standalone — `python wallet.py` generates one from the command line. |
 | `pow_hash.py` | The ONE place the proof-of-work hash is defined (Scrypt, Litecoin/Dogecoin's real parameters) — shared by `blockchain.py` and `miner.py` so they can never silently drift out of sync with each other. |
 | `blockchain.py` | The actual chain: `Block`, `Blockchain`, proof-of-work search, proof-of-stake kernel checks, difficulty retargeting (both PoW and PoS have their own, independent), full from-scratch chain re-validation. No I/O — pure functions/classes, reusable from both the live node and any future offline tooling. |
-| `node.py` | The always-on HTTP server: mempool, mining/staking/pool endpoints, SQLite persistence (one row per block), block gossip, peer sync (`/nodes/resolve` — longest valid chain wins). |
+| `node.py` | The always-on HTTP server: mempool, mining/staking/pool endpoints, SQLite persistence (one row per block), block gossip, peer sync (`/nodes/resolve` — the valid chain with the most work wins). |
 | `miner.py` | A standalone external miner — talks to a node purely over HTTP, so it can run on a different machine than the node itself. |
 
 ## What's built
@@ -142,7 +142,7 @@ node — they run heavy work inline and real mining/staking never need them
 | `GET /pos/status`, `GET /pos/stake` | PoS staking status / one manual stake attempt |
 | `GET /mine` | Convenience: node mines in-process (blocks the request until found — testing only) |
 | `POST /blocks/receive` | Gossip receiver (peer pushed a new block) |
-| `POST /nodes/register`, `GET /nodes/resolve` | Peer management / longest-valid-chain sync |
+| `POST /nodes/register`, `GET /nodes/resolve` | Peer management / most-work valid chain sync |
 
 ## Roadmap toward BTC/DOGE/Litecoin-level infrastructure
 
@@ -159,11 +159,10 @@ production. In roughly the order it'd make sense to tackle:
    bottleneck once the chain is long. A maintained running index (or a real
    UTXO model instead of the current account model) turns this from O(chain
    length) into O(1).
-3. **Retargeting history re-simulation.** `is_chain_valid` trusts each
-   block's own recorded difficulty target rather than replaying
-   `_maybe_retarget`/`_maybe_retarget_pos` block-by-block to confirm every
-   historical target was actually the correct one for its era. Real chains
-   do this replay as part of full validation.
+3. ~~**Retargeting history re-simulation.**~~ Done: `is_chain_valid` now
+   replays the retarget rules block by block and refuses any block whose
+   target is not the one they give, and peers choose between chains by
+   total work rather than length (`test_security_hardening.py`).
 4. **Light clients / SPV wallets.** Right now the only way to check a
    balance or send a transaction is to talk to a full node. Real usability
    at scale means a wallet that can verify just enough (Merkle proofs

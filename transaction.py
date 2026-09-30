@@ -26,6 +26,7 @@ lever, retargeting is the block-time lever.
 """
 import hashlib
 import json
+import math
 import time
 
 from ecdsa import SECP256k1, VerifyingKey, BadSignatureError
@@ -36,6 +37,21 @@ from ecdsa import SECP256k1, VerifyingKey, BadSignatureError
 # sent). Deliberately tiny: this whole chain exists in the spirit of
 # Dogecoin's cheap, casual, "just send it" transactions.
 MIN_FEE = 0.01
+
+# Security review, 2026-09-29. Every quantity a transaction carries must be a
+# REAL, FINITE number. Python's json accepts NaN and Infinity, and every
+# comparison against NaN is False -- so a NaN amount passed "amount <= 0",
+# every "balance < 0" sufficiency check, and (as a fee) made the coinbase
+# "sums to reward + fees" check compare NaN and pass with ANY reward: an
+# unlimited mint. bool is excluded too (True is an int in Python, i.e. 1).
+# The live chain was scanned before this rule was added: no historical
+# transaction violates it, so it applies at every height.
+MAX_QUANTITY = 10 ** 12   # far above any real quantity (the burned genesis premine was 5e9)
+
+
+def is_real_number(v, maximum=MAX_QUANTITY):
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and math.isfinite(v) and -maximum <= v <= maximum)
 
 
 class Transaction:
@@ -94,13 +110,25 @@ class Transaction:
         self.signature = wallet.sign(self.to_signing_string()).hex()
 
     def is_valid(self):
+        # Real, finite numbers only -- see is_real_number above. Checked
+        # first, for coinbase and signed transactions alike.
+        if not (is_real_number(self.amount) and is_real_number(self.fee)):
+            return False
+        if not (isinstance(self.timestamp, (int, float)) and not isinstance(self.timestamp, bool)
+                and math.isfinite(self.timestamp)):
+            return False
         if self.sender == "0":
             # Coinbase is reward-only — every real one built by blockchain.py
             # (mining/pool/staking reward txs) never sets op, so this is a
             # no-op for anything legitimate; it just closes off "sender=0
             # AND carries a user-directed op" as a combination nothing
             # should ever construct.
-            return self.op is None
+            # And never NEGATIVE (security review, 2026-09-29): the block
+            # rule only checks that a block's coinbase entries SUM to the
+            # reward, so +1000 to the miner and -900 to anyone else summed
+            # correctly while taking 900 from a stranger. Scanned: no
+            # historical coinbase is negative.
+            return self.op is None and self.amount >= 0
         if self.op is None:
             if self.amount <= 0:
                 return False

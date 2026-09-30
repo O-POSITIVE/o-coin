@@ -24,7 +24,7 @@ Two upgrades in this file specifically, on top of blockchain.py's own
     (fire-and-forget, doesn't block the response) instead of waiting for
     someone to eventually call /nodes/resolve. Peers that are already
     caught up accept it in one hop; a peer that's behind or has a
-    conflicting block falls back to the full longest-chain resolution
+    conflicting block falls back to the full most-work-chain resolution
     automatically.
 
 Run it:
@@ -253,23 +253,14 @@ def load_chain():
         return
     loaded_blocks = [Block.from_dict(r[0] if isinstance(r[0], dict) else json.loads(r[0])) for r in rows]
     candidate = [blockchain.chain[0]] + loaded_blocks
-    if blockchain.is_chain_valid(candidate):
-        blockchain.chain = candidate
-        blockchain._rebuild_balance_index()
-        # Pick each target from the last block of ITS OWN kind, not just
-        # candidate[-1] — the tip could be either a PoW or a PoS block,
-        # and blindly reading .target off whichever one happens to be
-        # last would silently corrupt the other difficulty (same fix as
-        # Blockchain.replace_chain, needed here for the same reason).
-        last_pow = next((b for b in reversed(candidate) if b.staker_address is None), None)
-        last_pos = next((b for b in reversed(candidate) if b.staker_address is not None), None)
-        if last_pow is not None:
-            blockchain.current_target = last_pow.target
-        if last_pos is not None:
-            blockchain.pos_target = last_pos.target
+    # adopt_chain validates from genesis and takes each next difficulty
+    # from replaying the retarget rules, not from the last block's header
+    # (which is one retarget stale whenever that block closed a window).
+    try:
+        blockchain.adopt_chain(candidate)
         print(f"Loaded {len(candidate)} blocks from {BLOCKS_TABLE}")
-    else:
-        print(f"WARNING: {BLOCKS_TABLE} failed validation, starting from genesis instead")
+    except ValueError as e:
+        print(f"WARNING: {BLOCKS_TABLE} failed validation ({e}), starting from genesis instead")
 
 
 def _peer_headers():
@@ -554,8 +545,36 @@ def receive_block():
             return jsonify({"status": "ok", "accepted": "direct"})
         except ValueError:
             pass  # doesn't cleanly extend our tip — fall through to full resolve
+    # Throttled (security review, 2026-09-29): every block that fails to
+    # extend our tip -- including any junk anyone POSTs -- used to trigger a
+    # download and full validation of every peer's whole chain, up to 120
+    # times a minute. One real fork needs one resolve; the rest are refused
+    # until the window passes (peer_sync_loop still catches up regardless).
+    global _last_fallback_resolve
+    now = time.time()
+    if now - _last_fallback_resolve < FALLBACK_RESOLVE_INTERVAL_S:
+        return jsonify({"status": "ok", "accepted": False, "replaced": False,
+                        "reason": "Block does not extend our tip; a resync ran recently"})
+    _last_fallback_resolve = now
     resolved = _resolve_with_peers()
     return jsonify({"status": "ok", "accepted": "resolved", "replaced": resolved})
+
+
+FALLBACK_RESOLVE_INTERVAL_S = 30
+_last_fallback_resolve = 0.0
+# Registered peers are fetched in full by every resolve, so the set is
+# bounded and only http(s) base URLs are taken (security review, 2026-09-29).
+MAX_PEERS = 64
+MAX_PEER_URL_LEN = 200
+
+
+def _clean_peer_url(url):
+    if not isinstance(url, str) or len(url) > MAX_PEER_URL_LEN:
+        return None
+    url = url.strip().rstrip("/")
+    if not (url.startswith("https://") or url.startswith("http://")) or any(c.isspace() for c in url):
+        return None
+    return url
 
 
 # ── Peer sync — the actual "network" half of "blockchain network" ──────────
@@ -564,55 +583,64 @@ def receive_block():
 def register_nodes():
     body = request.get_json(silent=True) or {}
     urls = body.get("nodes", [])
-    if not urls:
+    if not urls or not isinstance(urls, list):
         return jsonify({"status": "failed", "reason": "Provide a 'nodes' list of base URLs"}), 400
-    for url in urls:
-        peers.add(url.rstrip("/"))
+    cleaned = [_clean_peer_url(u) for u in urls[:MAX_PEERS]]
+    if any(u is None for u in cleaned):
+        return jsonify({"status": "failed", "reason": f"Each node must be an http(s) base URL of at most {MAX_PEER_URL_LEN} characters"}), 400
+    for url in cleaned:
+        if url not in peers and len(peers) < MAX_PEERS:
+            peers.add(url)
+    if set(cleaned) - peers:
+        return jsonify({"status": "partial", "reason": f"Peer list is full ({MAX_PEERS})", "peers": sorted(peers)})
     return jsonify({"status": "ok", "peers": sorted(peers)})
 
 
 def _resolve_with_peers():
     """The real consensus algorithm: ask every known peer for their
-    chain, and adopt the longest one that's actually valid — this is
+    chain, and adopt the one with the most work that's actually valid — this is
     what lets two nodes that mined different blocks around the same time
     (a natural, expected occurrence, not an error) converge back onto a
     single agreed history once one side pulls further ahead."""
     replaced = False
     headers = _peer_headers()
-    with chain_lock:
-        for peer in list(peers):
-            try:
-                # 60s, not the 2-5s the gossip paths use: /chain ships the
-                # peer's ENTIRE chain, and a cloud-hosted peer serving
-                # hundreds of blocks (plus a possible cold start) can
-                # legitimately take longer than a quick status ping. This
-                # call only happens on startup catch-up, explicit
-                # /nodes/resolve, and peer_sync_loop's already-throttled
-                # once-per-2-min check — never in a request hot path.
-                resp = requests.get(f"{peer}/chain", headers=headers, timeout=60)
-                # A peer that returns anything other than a real chain payload
-                # (a 401 from a secret mismatch, a 5xx, a cold-start HTML page,
-                # malformed JSON) must be SKIPPED, never fatal. Previously
-                # `data["chain"]` on a `{"reason":"Unauthorized"}` body raised
-                # KeyError straight out of the startup call in __main__ and
-                # crashed the whole node on boot — exactly the kind of thing
-                # that turns one peer being briefly down or out-of-sync into a
-                # total outage. A node always has its own persisted chain to
-                # fall back on, so skipping a bad peer is safe.
-                if resp.status_code != 200:
-                    print(f"Peer {peer} returned {resp.status_code} for /chain; skipping")
-                    continue
-                data = resp.json()
-                if not isinstance(data, dict) or "chain" not in data:
-                    print(f"Peer {peer} /chain response has no chain; skipping")
-                    continue
-                candidate = [Block.from_dict(b) for b in data["chain"]]
+    # The download happens OUTSIDE chain_lock; only the compare-and-swap is
+    # inside it (security review, 2026-09-29). Holding the lock across a
+    # 60-second fetch let one slow or hostile registered peer freeze mining,
+    # transaction submission and gossip for as long as it cared to stall.
+    for peer in list(peers):
+        try:
+            # 60s, not the 2-5s the gossip paths use: /chain ships the
+            # peer's ENTIRE chain, and a cloud-hosted peer serving
+            # hundreds of blocks (plus a possible cold start) can
+            # legitimately take longer than a quick status ping. This
+            # call only happens on startup catch-up, explicit
+            # /nodes/resolve, and peer_sync_loop's already-throttled
+            # once-per-2-min check — never in a request hot path.
+            resp = requests.get(f"{peer}/chain", headers=headers, timeout=60)
+            # A peer that returns anything other than a real chain payload
+            # (a 401 from a secret mismatch, a 5xx, a cold-start HTML page,
+            # malformed JSON) must be SKIPPED, never fatal. Previously
+            # `data["chain"]` on a `{"reason":"Unauthorized"}` body raised
+            # KeyError straight out of the startup call in __main__ and
+            # crashed the whole node on boot — exactly the kind of thing
+            # that turns one peer being briefly down or out-of-sync into a
+            # total outage. A node always has its own persisted chain to
+            # fall back on, so skipping a bad peer is safe.
+            if resp.status_code != 200:
+                print(f"Peer {peer} returned {resp.status_code} for /chain; skipping")
+                continue
+            data = resp.json()
+            if not isinstance(data, dict) or "chain" not in data:
+                print(f"Peer {peer} /chain response has no chain; skipping")
+                continue
+            candidate = [Block.from_dict(b) for b in data["chain"]]
+            with chain_lock:
                 if blockchain.replace_chain(candidate):
                     replaced = True
-            except (requests.RequestException, ValueError, KeyError, TypeError) as e:
-                print(f"Could not sync from peer {peer}: {e}")
-        if replaced:
-            save_full_chain()
+                    save_full_chain()
+        except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError) as e:
+            print(f"Could not sync from peer {peer}: {e}")
     return replaced
 
 
