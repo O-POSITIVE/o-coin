@@ -67,4 +67,42 @@ assert one_tick(ValueError("an HTML error page")) is False, "a junk answer is sk
 assert one_tick({"chain_work": "not-a-number"}) is False
 print("  more work -> fetched; longer-but-lighter -> ignored; old peers -> by length; junk -> skipped")
 
+print("\n=== 3: a stored chain that fails validation stops the node; it never restarts from genesis ===")
+from blockchain import Block  # noqa: E402
+
+stored = []
+
+
+class Cursor:
+    def execute(self, *args):
+        pass
+
+    def fetchall(self):
+        return stored
+
+
+class Conn:
+    def cursor(self):
+        return Cursor()
+
+    def close(self):
+        pass
+
+
+node.init_db = lambda: None
+node.get_pg = lambda: Conn()
+node.BLOCKS_TABLE = "ocoin_blocks_test"
+node.blockchain = node.Blockchain()
+stored[:] = [(Block(1, [], "f" * 64, 1, timestamp=1).to_dict(),)]   # does not link to genesis
+try:
+    node.load_chain()
+    raise AssertionError("a node started on a stored chain that fails validation")
+except SystemExit as e:
+    assert "REFUSING TO START" in str(e)
+    print("  refused:", str(e)[:90], "...")
+assert len(node.blockchain.chain) == 1, "and nothing was adopted"
+stored[:] = []
+node.load_chain()
+print("  an empty table (a brand-new node) still starts fresh")
+
 print("\n=== ALL NODE STATUS/SYNC SCENARIOS PASSED ===")

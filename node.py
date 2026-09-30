@@ -256,11 +256,23 @@ def load_chain():
     # adopt_chain validates from genesis and takes each next difficulty
     # from replaying the retarget rules, not from the last block's header
     # (which is one retarget stale whenever that block closed a window).
+    #
+    # A stored chain that fails validation STOPS the node (2026-09-30). It
+    # used to print a warning and start from genesis -- and the first block
+    # the keeper then mined was saved with an upsert on idx 1, overwriting
+    # the real block #1, and so on up the table: the node would have erased
+    # the chain's only copy one block at a time. The likely cause of a
+    # failure is a rule change the stored history does not satisfy, which is
+    # a bug in the change, never a reason to discard history. Exiting makes
+    # a Render deploy fail, which leaves the previous instance serving.
+    # A genuinely empty table (a brand-new node) never reaches here.
     try:
         blockchain.adopt_chain(candidate)
         print(f"Loaded {len(candidate)} blocks from {BLOCKS_TABLE}")
     except ValueError as e:
-        print(f"WARNING: {BLOCKS_TABLE} failed validation ({e}), starting from genesis instead")
+        raise SystemExit(
+            f"REFUSING TO START: the {len(candidate)} blocks stored in {BLOCKS_TABLE} failed validation ({e}). "
+            "Nothing was changed. Fix the rule or the data; never start this node from genesis over existing history.")
 
 
 def _peer_headers():
