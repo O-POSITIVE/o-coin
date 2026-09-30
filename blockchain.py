@@ -45,6 +45,29 @@ from pow_hash import header_fields_to_hash
 
 from transaction import Transaction, is_real_number
 
+# The ledger counts whole UNITS, never fractional coins (2026-09-30), the
+# way Bitcoin counts satoshis: 1 coin = 100,000,000 units, the smallest
+# amount anything can hold. See _apply_transaction_to_balance_dict.
+UNITS_PER_COIN = 10 ** 8
+
+
+def to_units(amount):
+    """A decimal amount, as a transaction carries it, in whole units.
+    Deterministic on every platform: the multiplication and Python's
+    round() are both exactly specified for IEEE 754 doubles. An int is
+    multiplied exactly, never through a float."""
+    if isinstance(amount, int):
+        return amount * UNITS_PER_COIN
+    if not math.isfinite(amount):
+        raise ValueError(f"not a finite amount: {amount!r}")
+    return int(round(amount * UNITS_PER_COIN))
+
+
+def to_coins(units):
+    """Units back to coins, for display and the HTTP API only -- never for a
+    consensus decision."""
+    return units / UNITS_PER_COIN
+
 
 class Block:
     def __init__(self, index, transactions, previous_hash, target, timestamp=None, nonce=0, staker_address=None):
@@ -184,13 +207,17 @@ class Blockchain:
     MEMPOOL_MAX = 5000
     # The release whose consensus rules this code enforces; node.py reports
     # it in /status. Bump it with every change to what a valid block is.
-    RULES_VERSION = "0.1.0"
-    # How far below zero float rounding may leave a balance before a block
-    # is refused for overspending it (security review, 2026-09-29). Amounts
-    # are floats, and "send the whole balance" can land a hair under zero
-    # depending on the order the pieces were added; a billionth of a coin is
-    # far below anything spendable and far above any rounding error.
-    BALANCE_EPSILON = 1e-9
+    RULES_VERSION = "0.2.0"
+    # From this block on (2026-09-30): signed quantities must be whole
+    # units, a block's coinbase must equal reward + fees EXACTLY in units,
+    # and the pool formulas are integer ones (see
+    # _apply_transaction_to_balance_dict). Before it, history keeps the
+    # rules it was made under. The units LEDGER itself applies from genesis:
+    # the whole live chain was replayed both ways before this was added and
+    # agrees to the unit. Must be ahead of the live tip when this ships --
+    # a block the old code made at or past it would be judged by new rules.
+    INTEGER_UNITS_ACTIVATION_HEIGHT = 17_500
+    OP_QUANTITY_FIELDS = ("amount_a", "amount_b", "amount_in", "min_amount_out", "lp_amount")
 
     # ── Emission curve — smooth EXPONENTIAL decay toward a permanent
     # floor, not Bitcoin/Dogecoin-style discrete halving and not a
@@ -662,7 +689,8 @@ class Blockchain:
         deposits/withdrawals. A pure function of (balances, asset_supply),
         exactly as independently re-derivable by every node as everything
         else in this file — never a separately-signed or separately-stored
-        number."""
+        number. Balances are in units, so this is a ratio of units, the
+        same ratio as of coins."""
         stocn_supply = asset_supply.get("stOCN", 0)
         if stocn_supply <= 0:
             return 1.0
@@ -678,8 +706,8 @@ class Blockchain:
         return {
             "pool_address": self.STAKE_POOL_ADDRESS,
             "exchange_rate": self._stake_pool_exchange_rate(self.balances, self.asset_supply),
-            "total_staked_ocn": self.balances.get((self.STAKE_POOL_ADDRESS, "OCN"), 0),
-            "total_stocn_supply": self.asset_supply.get("stOCN", 0),
+            "total_staked_ocn": to_coins(self.balances.get((self.STAKE_POOL_ADDRESS, "OCN"), 0)),
+            "total_stocn_supply": to_coins(self.asset_supply.get("stOCN", 0)),
         }
 
     def list_pools(self):
@@ -703,15 +731,15 @@ class Blockchain:
         asset_a, asset_b = pool_key.split(":")
         pool_addr = self._pool_address(pool_key)
         lp_asset = self._lp_asset_id(pool_key)
-        reserve_a = self.balances.get((pool_addr, asset_a), 0)
-        reserve_b = self.balances.get((pool_addr, asset_b), 0)
+        reserve_a = to_coins(self.balances.get((pool_addr, asset_a), 0))
+        reserve_b = to_coins(self.balances.get((pool_addr, asset_b), 0))
         return {
             "pool_key": pool_key,
             "pool_address": pool_addr,
             "asset_a": asset_a, "reserve_a": reserve_a,
             "asset_b": asset_b, "reserve_b": reserve_b,
             "lp_asset": lp_asset,
-            "lp_supply": self.asset_supply.get(lp_asset, 0),
+            "lp_supply": to_coins(self.asset_supply.get(lp_asset, 0)),
             "price_a_in_b": (reserve_b / reserve_a) if reserve_a > 0 else None,
             "price_b_in_a": (reserve_a / reserve_b) if reserve_b > 0 else None,
         }
@@ -734,15 +762,15 @@ class Blockchain:
         last = (0, 0)
         for block in self.chain:
             for tx in block.transactions:
-                self._apply_transaction_to_balance_dict(balances, tx, asset_supply)
+                self._apply_transaction_to_balance_dict(balances, tx, asset_supply, height=block.index)
             snapshot = (balances.get(pool_ocn_key, 0), asset_supply.get("stOCN", 0))
             if snapshot != last:
                 last = snapshot
                 history.append({
                     "height": block.index,
                     "timestamp": block.timestamp,
-                    "total_staked_ocn": snapshot[0],
-                    "total_stocn_supply": snapshot[1],
+                    "total_staked_ocn": to_coins(snapshot[0]),
+                    "total_stocn_supply": to_coins(snapshot[1]),
                     "exchange_rate": self._stake_pool_exchange_rate(balances, asset_supply),
                 })
         return history
@@ -765,11 +793,11 @@ class Blockchain:
             for tx in block.transactions:
                 if tx.op == "pool_swap" and (tx.op_data or {}).get("pool_key") == pool_key:
                     swap_volume += (tx.op_data or {}).get("amount_in", 0)
-                self._apply_transaction_to_balance_dict(balances, tx, asset_supply)
+                self._apply_transaction_to_balance_dict(balances, tx, asset_supply, height=block.index)
             snapshot = (balances.get((pool_addr, asset_a), 0), balances.get((pool_addr, asset_b), 0), asset_supply.get(lp_asset, 0))
             if snapshot != last:
                 last = snapshot
-                reserve_a, reserve_b, lp_supply = snapshot
+                reserve_a, reserve_b, lp_supply = (to_coins(u) for u in snapshot)
                 history.append({
                     "height": block.index,
                     "timestamp": block.timestamp,
@@ -780,112 +808,117 @@ class Blockchain:
                 })
         return history
 
-    @staticmethod
-    def _apply_transaction_to_balance_dict(balances, tx, asset_supply):
+    @classmethod
+    def _apply_transaction_to_balance_dict(cls, balances, tx, asset_supply, *, height):
         """The one place transaction accounting actually happens, for every
         transaction/op kind this chain knows about. Operates on passed-in
         dicts rather than self.balances/self.asset_supply directly so it can
         be reused both for the real index (_rebuild_balance_index/
         accept_block) and for throwaway local/scratch dicts (get_balance's
-        explicit chain= scan, is_chain_valid's from-scratch candidate-chain
-        walk, add_transaction's pending-mempool preview) without duplicating
-        this logic anywhere and risking the copies drifting apart.
+        explicit chain= scan, the from-scratch candidate-chain walk,
+        add_transaction's pending-mempool preview) without duplicating this
+        logic anywhere and risking the copies drifting apart.
+
+        Every balance and supply here is a whole number of UNITS (1 coin =
+        UNITS_PER_COIN units, as Bitcoin counts satoshis), since 2026-09-30.
+        Decimal fractions cannot be added exactly in binary floating point, so
+        a float ledger drifts by specks, a whole balance can land a hair below
+        zero, and "can this sender afford it" needed a tolerance. Integers add
+        exactly. Transactions still CARRY decimal amounts, exactly as they are
+        signed; each one is converted to units once, here, by to_units.
+
+        `height` is the block the transaction is in (or would be in). It
+        selects the pool formulas: below INTEGER_UNITS_ACTIVATION_HEIGHT the
+        original floating-point formulas, reproducing every historical pool
+        result exactly; from it on, integer formulas that round in the
+        pool's favour and can never pay out more than a reserve holds.
 
         Returns the list of (address, asset_id) balance keys this call
-        DEBITED (subtracted from) — callers doing balance-sufficiency
-        checks use this to verify none of them went negative, without
-        needing their own per-op knowledge of what gets debited by what
-        (this is what closes a real gap A3 originally had: its block-level
-        check verified the ASSET side of a transfer_asset but never the fee
-        side, since that check was hand-written per-op instead of derived
-        generically like this)."""
+        DEBITED (subtracted from) — callers doing balance-sufficiency checks
+        use this to verify none of them went negative, without needing their
+        own per-op knowledge of what gets debited by what."""
+        exact = height >= cls.INTEGER_UNITS_ACTIVATION_HEIGHT
         debited = []
+
+        def debit(key, units):
+            balances[key] = balances.get(key, 0) - units
+            debited.append(key)
+
+        def credit(key, units):
+            balances[key] = balances.get(key, 0) + units
+
+        fee_u = to_units(tx.fee)
         if tx.op == "stake_pool_deposit":
-            # Exchange rate computed from state as it stands BEFORE this
-            # deposit's own effects are applied below — every node sees the
-            # identical prior state and so computes the identical rate,
-            # which is what makes this protocol-computed mint deterministic
-            # and independently re-derivable rather than a separately-
-            # signed claim.
-            # rate is OCN-per-stOCN (see _stake_pool_exchange_rate) — as the
-            # pool earns rewards, each stOCN becomes redeemable for MORE
-            # OCN, so a deposit of `amount` OCN must mint FEWER stOCN as the
-            # rate rises: divide OCN by OCN-per-stOCN to get stOCN units.
-            rate = Blockchain._stake_pool_exchange_rate(balances, asset_supply)
-            minted = round(tx.amount / rate, 6) if rate > 0 else tx.amount
+            # Rate from state BEFORE this deposit's own effects, so every node
+            # computes the identical mint. OCN-per-stOCN: as the pool earns
+            # rewards each stOCN redeems for more OCN, so a deposit mints
+            # fewer stOCN -- divide OCN by the rate.
+            amount_u = to_units(tx.amount)
+            pool_u = balances.get((cls.STAKE_POOL_ADDRESS, "OCN"), 0)
+            supply_u = asset_supply.get("stOCN", 0)
+            if exact:
+                minted_u = amount_u * supply_u // pool_u if supply_u > 0 and pool_u > 0 else amount_u
+            else:
+                rate = cls._stake_pool_exchange_rate(balances, asset_supply)
+                minted_u = to_units(round(tx.amount / rate, 6) if rate > 0 else tx.amount)
             if tx.sender != "0":
-                sender_ocn_key = (tx.sender, "OCN")
-                balances[sender_ocn_key] = balances.get(sender_ocn_key, 0) - tx.total_cost()
-                debited.append(sender_ocn_key)
-            pool_key = (tx.recipient, "OCN")  # tx.recipient == STAKE_POOL_ADDRESS, enforced by _validate_op
-            balances[pool_key] = balances.get(pool_key, 0) + tx.amount
-            stocn_key = (tx.sender, "stOCN")
-            balances[stocn_key] = balances.get(stocn_key, 0) + minted
-            asset_supply["stOCN"] = asset_supply.get("stOCN", 0) + minted
+                debit((tx.sender, "OCN"), amount_u + fee_u)
+            credit((tx.recipient, "OCN"), amount_u)  # tx.recipient == STAKE_POOL_ADDRESS, enforced by _validate_op
+            credit((tx.sender, "stOCN"), minted_u)
+            asset_supply["stOCN"] = asset_supply.get("stOCN", 0) + minted_u
             return debited
         if tx.op == "stake_pool_withdraw":
-            # Inverse of the deposit formula above: redeeming `amount`
-            # stOCN units at rate (OCN-per-stOCN) gives back that many OCN —
-            # multiply, don't divide.
-            rate = Blockchain._stake_pool_exchange_rate(balances, asset_supply)
-            redeemed_ocn = round(tx.amount * rate, 6)
-            stocn_key = (tx.sender, "stOCN")
-            balances[stocn_key] = balances.get(stocn_key, 0) - tx.amount
-            debited.append(stocn_key)
-            asset_supply["stOCN"] = asset_supply.get("stOCN", 0) - tx.amount
+            # Inverse of the deposit: redeeming stOCN at OCN-per-stOCN gives
+            # back that many OCN -- multiply.
+            amount_u = to_units(tx.amount)
+            pool_u = balances.get((cls.STAKE_POOL_ADDRESS, "OCN"), 0)
+            supply_u = asset_supply.get("stOCN", 0)
+            if exact:
+                redeemed_u = amount_u * pool_u // supply_u if supply_u > 0 else amount_u
+            else:
+                rate = cls._stake_pool_exchange_rate(balances, asset_supply)
+                redeemed_u = to_units(round(tx.amount * rate, 6))
+            debit((tx.sender, "stOCN"), amount_u)
+            asset_supply["stOCN"] = asset_supply.get("stOCN", 0) - amount_u
             if tx.sender != "0":
-                fee_key = (tx.sender, "OCN")
-                balances[fee_key] = balances.get(fee_key, 0) - tx.fee
-                debited.append(fee_key)
-            pool_key = (Blockchain.STAKE_POOL_ADDRESS, "OCN")
-            balances[pool_key] = balances.get(pool_key, 0) - redeemed_ocn
-            recipient_key = (tx.recipient, "OCN")  # tx.recipient == tx.sender, enforced by _validate_op
-            balances[recipient_key] = balances.get(recipient_key, 0) + redeemed_ocn
+                debit((tx.sender, "OCN"), fee_u)
+            debit((cls.STAKE_POOL_ADDRESS, "OCN"), redeemed_u)
+            credit((tx.recipient, "OCN"), redeemed_u)  # tx.recipient == tx.sender, enforced by _validate_op
             return debited
         if tx.op == "pool_add_liquidity":
             pool_key = tx.op_data["pool_key"]
             asset_a, asset_b = pool_key.split(":")
             amount_a, amount_b = tx.op_data["amount_a"], tx.op_data["amount_b"]
-            pool_addr = Blockchain._pool_address(pool_key)
-            lp_asset = Blockchain._lp_asset_id(pool_key)
-            reserve_a = balances.get((pool_addr, asset_a), 0)
-            reserve_b = balances.get((pool_addr, asset_b), 0)
-            lp_supply = asset_supply.get(lp_asset, 0)
-            if lp_supply <= 0 or reserve_a <= 0 or reserve_b <= 0:
-                # Bootstrap mint (Uniswap V2's formula) — sqrt is the ONE
-                # transcendental-looking op used anywhere in this file's
-                # consensus math, and it's safe specifically BECAUSE unlike
-                # pow/exp/log with an irrational exponent (see
-                # REWARD_DECAY_RATE_FIXED's docstring for why THAT one isn't
-                # safe), IEEE 754 requires sqrt to be correctly rounded —
-                # identical on every conformant platform, same guarantee
-                # reward_at_height's own docstring already relies on for
-                # plain division.
-                minted_lp = round((amount_a * amount_b) ** 0.5, 6)
+            a_u, b_u = to_units(amount_a), to_units(amount_b)
+            pool_addr = cls._pool_address(pool_key)
+            lp_asset = cls._lp_asset_id(pool_key)
+            reserve_a_u = balances.get((pool_addr, asset_a), 0)
+            reserve_b_u = balances.get((pool_addr, asset_b), 0)
+            lp_supply_u = asset_supply.get(lp_asset, 0)
+            bootstrap = lp_supply_u <= 0 or reserve_a_u <= 0 or reserve_b_u <= 0
+            if exact:
+                # Uniswap V2's formulas in whole units: the first deposit
+                # mints sqrt(a*b) (sqrt of units*units is units), later ones
+                # the SMALLER of the two proportional shares, rounded down.
+                if bootstrap:
+                    minted_lp_u = math.isqrt(a_u * b_u)
+                else:
+                    minted_lp_u = min(a_u * lp_supply_u // reserve_a_u, b_u * lp_supply_u // reserve_b_u)
+            elif bootstrap:
+                # IEEE 754 requires sqrt to be correctly rounded, so this is
+                # identical on every conformant platform, like division.
+                minted_lp_u = to_units(round((amount_a * amount_b) ** 0.5, 6))
             else:
-                # Proportional to existing reserves, using whichever side
-                # is the SMALLER ratio — protects existing LPs from a
-                # lopsided deposit minting more LP than either side of the
-                # contribution actually justifies (same rule Uniswap V2
-                # enforces the same way).
-                minted_lp = round(min(amount_a / reserve_a, amount_b / reserve_b) * lp_supply, 6)
+                reserve_a, reserve_b, lp_supply = to_coins(reserve_a_u), to_coins(reserve_b_u), to_coins(lp_supply_u)
+                minted_lp_u = to_units(round(min(amount_a / reserve_a, amount_b / reserve_b) * lp_supply, 6))
             if tx.sender != "0":
-                fee_key = (tx.sender, "OCN")
-                balances[fee_key] = balances.get(fee_key, 0) - tx.fee
-                debited.append(fee_key)
-                a_key = (tx.sender, asset_a)
-                balances[a_key] = balances.get(a_key, 0) - amount_a
-                debited.append(a_key)
-                b_key = (tx.sender, asset_b)
-                balances[b_key] = balances.get(b_key, 0) - amount_b
-                debited.append(b_key)
-            pool_a_key = (pool_addr, asset_a)
-            balances[pool_a_key] = balances.get(pool_a_key, 0) + amount_a
-            pool_b_key = (pool_addr, asset_b)
-            balances[pool_b_key] = balances.get(pool_b_key, 0) + amount_b
-            lp_key = (tx.sender, lp_asset)
-            balances[lp_key] = balances.get(lp_key, 0) + minted_lp
-            asset_supply[lp_asset] = asset_supply.get(lp_asset, 0) + minted_lp
+                debit((tx.sender, "OCN"), fee_u)
+                debit((tx.sender, asset_a), a_u)
+                debit((tx.sender, asset_b), b_u)
+            credit((pool_addr, asset_a), a_u)
+            credit((pool_addr, asset_b), b_u)
+            credit((tx.sender, lp_asset), minted_lp_u)
+            asset_supply[lp_asset] = asset_supply.get(lp_asset, 0) + minted_lp_u
             return debited
         if tx.op == "pool_swap":
             pool_key = tx.op_data["pool_key"]
@@ -894,102 +927,84 @@ class Blockchain:
             asset_out = asset_b if asset_in == asset_a else asset_a
             amount_in = tx.op_data["amount_in"]
             min_amount_out = tx.op_data.get("min_amount_out", 0)
-            pool_addr = Blockchain._pool_address(pool_key)
-            reserve_in = balances.get((pool_addr, asset_in), 0)
-            reserve_out = balances.get((pool_addr, asset_out), 0)
-            # Constant product x*y=k with a 0.3% input-side fee, integer
-            # ratio only (see POOL_SWAP_FEE_NUMERATOR/DENOMINATOR) — no
-            # float anywhere in the actual output calculation until the
-            # single final division, which (like reward_at_height's own
-            # final division) IEEE 754 guarantees is correctly rounded.
-            amount_in_after_fee = amount_in * Blockchain.POOL_SWAP_FEE_NUMERATOR
-            denominator = reserve_in * Blockchain.POOL_SWAP_FEE_DENOMINATOR + amount_in_after_fee
-            amount_out = round((amount_in_after_fee * reserve_out) / denominator, 6) if denominator > 0 else 0
-            if amount_out < min_amount_out:
-                # State-dependent slippage failure — can't be caught by
-                # _validate_op (which only sees the transaction, never
-                # chain state), so this is the one op that can make this
-                # normally-never-raises accounting function raise. Every
-                # caller (add_transaction, accept_block, is_chain_valid)
-                # already treats a ValueError from validation as this
-                # transaction/block being rejected.
-                raise ValueError(f"pool_swap would output {amount_out} {asset_out}, below min_amount_out {min_amount_out} (slippage)")
+            in_u = to_units(amount_in)
+            pool_addr = cls._pool_address(pool_key)
+            reserve_in_u = balances.get((pool_addr, asset_in), 0)
+            reserve_out_u = balances.get((pool_addr, asset_out), 0)
+            # Constant product x*y=k with a 0.3% input-side fee (see
+            # POOL_SWAP_FEE_NUMERATOR/DENOMINATOR).
+            if exact:
+                in_after_fee = in_u * cls.POOL_SWAP_FEE_NUMERATOR
+                denominator = reserve_in_u * cls.POOL_SWAP_FEE_DENOMINATOR + in_after_fee
+                out_u = in_after_fee * reserve_out_u // denominator if denominator > 0 else 0
+            else:
+                reserve_in, reserve_out = to_coins(reserve_in_u), to_coins(reserve_out_u)
+                amount_in_after_fee = amount_in * cls.POOL_SWAP_FEE_NUMERATOR
+                denominator = reserve_in * cls.POOL_SWAP_FEE_DENOMINATOR + amount_in_after_fee
+                out_u = to_units(round((amount_in_after_fee * reserve_out) / denominator, 6) if denominator > 0 else 0)
+            if out_u < to_units(min_amount_out):
+                # State-dependent slippage failure — _validate_op only sees
+                # the transaction, never chain state, so this is the one op
+                # that can make this accounting function raise. Every caller
+                # treats a ValueError here as the transaction/block rejected.
+                raise ValueError(f"pool_swap would output {to_coins(out_u)} {asset_out}, below min_amount_out {min_amount_out} (slippage)")
             if tx.sender != "0":
-                fee_key = (tx.sender, "OCN")
-                balances[fee_key] = balances.get(fee_key, 0) - tx.fee
-                debited.append(fee_key)
-                in_key = (tx.sender, asset_in)
-                balances[in_key] = balances.get(in_key, 0) - amount_in
-                debited.append(in_key)
-            pool_in_key = (pool_addr, asset_in)
-            balances[pool_in_key] = balances.get(pool_in_key, 0) + amount_in
-            pool_out_key = (pool_addr, asset_out)
-            balances[pool_out_key] = balances.get(pool_out_key, 0) - amount_out
-            debited.append(pool_out_key)  # the pool's own reserve must never go negative either — mathematically guaranteed by the formula above, checked anyway as a free safety net
-            recipient_key = (tx.recipient, asset_out)  # tx.recipient == tx.sender, enforced by _validate_op
-            balances[recipient_key] = balances.get(recipient_key, 0) + amount_out
+                debit((tx.sender, "OCN"), fee_u)
+                debit((tx.sender, asset_in), in_u)
+            credit((pool_addr, asset_in), in_u)
+            debit((pool_addr, asset_out), out_u)  # the pool's reserve must never go negative either
+            credit((tx.recipient, asset_out), out_u)  # tx.recipient == tx.sender, enforced by _validate_op
             return debited
         if tx.op == "pool_remove_liquidity":
             pool_key = tx.op_data["pool_key"]
             asset_a, asset_b = pool_key.split(":")
             lp_amount = tx.op_data["lp_amount"]
-            pool_addr = Blockchain._pool_address(pool_key)
-            lp_asset = Blockchain._lp_asset_id(pool_key)
-            lp_supply = asset_supply.get(lp_asset, 0)
-            reserve_a = balances.get((pool_addr, asset_a), 0)
-            reserve_b = balances.get((pool_addr, asset_b), 0)
-            share = (lp_amount / lp_supply) if lp_supply > 0 else 0
-            out_a = round(reserve_a * share, 6)
-            out_b = round(reserve_b * share, 6)
-            lp_key = (tx.sender, lp_asset)
-            balances[lp_key] = balances.get(lp_key, 0) - lp_amount
-            debited.append(lp_key)
-            asset_supply[lp_asset] = asset_supply.get(lp_asset, 0) - lp_amount
+            lp_u = to_units(lp_amount)
+            pool_addr = cls._pool_address(pool_key)
+            lp_asset = cls._lp_asset_id(pool_key)
+            lp_supply_u = asset_supply.get(lp_asset, 0)
+            reserve_a_u = balances.get((pool_addr, asset_a), 0)
+            reserve_b_u = balances.get((pool_addr, asset_b), 0)
+            if exact:
+                # Rounded down, so the last provider out can never be owed
+                # more than the reserve holds.
+                out_a_u = reserve_a_u * lp_u // lp_supply_u if lp_supply_u > 0 else 0
+                out_b_u = reserve_b_u * lp_u // lp_supply_u if lp_supply_u > 0 else 0
+            else:
+                share = (lp_amount / to_coins(lp_supply_u)) if lp_supply_u > 0 else 0
+                out_a_u = to_units(round(to_coins(reserve_a_u) * share, 6))
+                out_b_u = to_units(round(to_coins(reserve_b_u) * share, 6))
+            debit((tx.sender, lp_asset), lp_u)
+            asset_supply[lp_asset] = asset_supply.get(lp_asset, 0) - lp_u
             if tx.sender != "0":
-                fee_key = (tx.sender, "OCN")
-                balances[fee_key] = balances.get(fee_key, 0) - tx.fee
-                debited.append(fee_key)
-            pool_a_key = (pool_addr, asset_a)
-            balances[pool_a_key] = balances.get(pool_a_key, 0) - out_a
-            debited.append(pool_a_key)
-            pool_b_key = (pool_addr, asset_b)
-            balances[pool_b_key] = balances.get(pool_b_key, 0) - out_b
-            debited.append(pool_b_key)
-            recipient_a_key = (tx.recipient, asset_a)  # tx.recipient == tx.sender, enforced by _validate_op
-            balances[recipient_a_key] = balances.get(recipient_a_key, 0) + out_a
-            recipient_b_key = (tx.recipient, asset_b)
-            balances[recipient_b_key] = balances.get(recipient_b_key, 0) + out_b
+                debit((tx.sender, "OCN"), fee_u)
+            debit((pool_addr, asset_a), out_a_u)
+            debit((pool_addr, asset_b), out_b_u)
+            credit((tx.recipient, asset_a), out_a_u)  # tx.recipient == tx.sender, enforced by _validate_op
+            credit((tx.recipient, asset_b), out_b_u)
             return debited
-        # Plain transfer (op=None) or transfer_asset — the original A1/A3
-        # accounting: net total_cost() for the sender when the moved asset
-        # IS OCN, a fee-only OCN debit plus a separate asset debit
-        # otherwise; the recipient always just gains the amount, in
-        # whatever asset moved.
-        asset_id = Blockchain._asset_id_of(tx)
+        # Plain transfer (op=None) or transfer_asset: the sender pays amount
+        # plus fee when the moved asset IS OCN, otherwise the fee in OCN and
+        # the amount in the asset; the recipient gains the amount.
+        asset_id = cls._asset_id_of(tx)
+        amount_u = to_units(tx.amount)
         if tx.sender != "0":
             if asset_id == "OCN":
-                key = (tx.sender, "OCN")
-                balances[key] = balances.get(key, 0) - tx.total_cost()
-                debited.append(key)
+                debit((tx.sender, "OCN"), amount_u + fee_u)
             else:
-                fee_key = (tx.sender, "OCN")
-                balances[fee_key] = balances.get(fee_key, 0) - tx.fee
-                debited.append(fee_key)
-                asset_key = (tx.sender, asset_id)
-                balances[asset_key] = balances.get(asset_key, 0) - tx.amount
-                debited.append(asset_key)
-        recipient_key = (tx.recipient, asset_id)
-        balances[recipient_key] = balances.get(recipient_key, 0) + tx.amount
+                debit((tx.sender, "OCN"), fee_u)
+                debit((tx.sender, asset_id), amount_u)
+        credit((tx.recipient, asset_id), amount_u)
         return debited
 
-    def _apply_transaction_to_balances(self, tx):
-        self._apply_transaction_to_balance_dict(self.balances, tx, self.asset_supply)
+    def _apply_transaction_to_balances(self, tx, height):
+        self._apply_transaction_to_balance_dict(self.balances, tx, self.asset_supply, height=height)
 
     def _rebuild_balance_index(self):
         """Full walk of self.chain, recomputing every address's balance
         (across every asset_id seen) AND every non-OCN asset's total
-        circulating supply from scratch. Called whenever self.chain is
-        replaced WHOLESALE — genesis creation, load_chain() adopting the
+        circulating supply from scratch, in units. Called whenever self.chain
+        is replaced WHOLESALE — genesis creation, load_chain() adopting the
         startup chain, replace_chain() swapping in a candidate — as opposed
         to growing by one block, which accept_block updates incrementally
         instead (see _apply_transaction_to_balances)."""
@@ -997,38 +1012,38 @@ class Blockchain:
         self.asset_supply = {}
         for block in self.chain:
             for tx in block.transactions:
-                self._apply_transaction_to_balances(tx)
+                self._apply_transaction_to_balances(tx, block.index)
 
-    def get_balance(self, address, asset_id="OCN", include_pending=False, chain=None):
-        """Balance of one (address, asset_id) pair. No account/balance table
-        exists anywhere — a wallet's balance is always *derived* from
-        transaction history, same as every real UTXO-model or account-model
-        chain; there's nothing else to trust or that could get out of sync.
+    def get_balance_units(self, address, asset_id="OCN", include_pending=False, chain=None):
+        """Balance of one (address, asset_id) pair, in whole units. No
+        balance table exists anywhere — a balance is always *derived* from
+        transaction history, so there's nothing else to trust or that could
+        get out of sync.
 
-        Accepts an explicit `chain` (used by is_chain_valid when checking a
-        CANDIDATE chain's stake weights/balances against ITS OWN history,
-        not necessarily this instance's currently-accepted one) — that path
-        stays a full from-scratch scan: the index only ever reflects
-        self.chain as currently adopted, and validating a not-yet-adopted
-        candidate must stay fully independent of it. Every other (the
-        overwhelming majority of) caller passes no chain and gets the O(1)
-        indexed lookup instead of a full scan. Both paths funnel through
-        _apply_transaction_to_balance_dict so they can never compute two
-        different answers for the same chain."""
+        An explicit `chain` is scanned from scratch (a candidate chain must
+        be judged by ITS OWN history, never this instance's index); every
+        other caller gets the O(1) indexed lookup. Both funnel through
+        _apply_transaction_to_balance_dict so they can never disagree."""
         if chain is not None:
             local, local_supply = {}, {}
             for block in chain:
                 for tx in block.transactions:
-                    self._apply_transaction_to_balance_dict(local, tx, local_supply)
+                    self._apply_transaction_to_balance_dict(local, tx, local_supply, height=block.index)
             balance = local.get((address, asset_id), 0)
         else:
             balance = self.balances.get((address, asset_id), 0)
         if include_pending:
             pending_local, pending_supply = {}, {}
+            next_height = self.latest_block.index + 1
             for tx in self.mempool:
-                self._apply_transaction_to_balance_dict(pending_local, tx, pending_supply)
+                self._apply_transaction_to_balance_dict(pending_local, tx, pending_supply, height=next_height)
             balance += pending_local.get((address, asset_id), 0)
         return balance
+
+    def get_balance(self, address, asset_id="OCN", include_pending=False, chain=None):
+        """The same balance in coins, for display and the HTTP API, which
+        have always spoken in coins. Consensus checks use get_balance_units."""
+        return to_coins(self.get_balance_units(address, asset_id, include_pending, chain))
 
     def add_transaction(self, tx: Transaction):
         """Raises ValueError with a human-readable reason on rejection —
@@ -1068,15 +1083,17 @@ class Blockchain:
             # debited" pattern accept_block/is_chain_valid use for their own
             # block-level version of this check, so there's exactly one
             # place that knows what each op debits, not three.
+            next_height = self.latest_block.index + 1
+            self._validate_unit_precision(tx, next_height)
             preview_balances = dict(self.balances)
             preview_supply = dict(self.asset_supply)
             for pending in self.mempool:
-                self._apply_transaction_to_balance_dict(preview_balances, pending, preview_supply)
-            debited_keys = self._apply_transaction_to_balance_dict(preview_balances, tx, preview_supply)
+                self._apply_transaction_to_balance_dict(preview_balances, pending, preview_supply, height=next_height)
+            debited_keys = self._apply_transaction_to_balance_dict(preview_balances, tx, preview_supply, height=next_height)
             for key in debited_keys:
                 if preview_balances.get(key, 0) < 0:
                     addr, asset = key
-                    raise ValueError(f"Insufficient {asset} balance: {addr} would go to {preview_balances[key]}")
+                    raise ValueError(f"Insufficient {asset} balance: {addr} would go to {to_coins(preview_balances[key])}")
         # Bounded mempool (see MEMPOOL_MAX): when full, only accept a new tx if
         # it outbids the cheapest pending one, then evict that cheapest. Keeps
         # the now-public submission endpoint from being an unbounded-growth DoS
@@ -1104,6 +1121,7 @@ class Blockchain:
         Coinbase is not counted as funding: conservative, and it keeps the
         choice independent of who is paid."""
         from collections import ChainMap
+        height = self.latest_block.index + 1
         balances, supply = dict(self.balances), dict(self.asset_supply)
         pending = sorted(self.mempool, key=lambda t: t.fee, reverse=True)
         chosen = []
@@ -1117,11 +1135,12 @@ class Blockchain:
                 try:
                     if tx.op is not None:
                         self._validate_op(tx)
-                    debited = self._apply_transaction_to_balance_dict(trial_b, tx, trial_s)
+                    self._validate_unit_precision(tx, height)
+                    debited = self._apply_transaction_to_balance_dict(trial_b, tx, trial_s, height=height)
                 except ValueError:
                     deferred.append(tx)
                     continue
-                if any(trial_b.get(k, 0) < -self.BALANCE_EPSILON for k in debited):
+                if any(trial_b.get(k, 0) < 0 for k in debited):
                     deferred.append(tx)
                     continue
                 balances.update(trial_b.maps[0])
@@ -1152,9 +1171,10 @@ class Blockchain:
         even as the block reward itself shrinks over a chain's lifetime.
         """
         included = self._select_includable(max_transactions)
-        total_fees = sum(t.fee for t in included)
-        block_reward = self.reward_at_height(self.latest_block.index + 1)
-        reward_tx = Transaction(sender="0", recipient=miner_address, amount=block_reward + total_fees, fee=0)
+        # Summed in units so the coinbase is exactly reward + fees (a float
+        # sum of decimals can land a speck off; see _check_coinbase).
+        total_u = to_units(self.reward_at_height(self.latest_block.index + 1)) + sum(to_units(t.fee) for t in included)
+        reward_tx = Transaction(sender="0", recipient=miner_address, amount=to_coins(total_u), fee=0)
         return Block(
             index=self.latest_block.index + 1,
             transactions=[reward_tx] + included,
@@ -1178,31 +1198,30 @@ class Blockchain:
         real mining pools use (PPLNS-style), which is what makes it safe
         to fix the payout list before mining begins.
 
-        Integer division leaves a small remainder (the reward doesn't
-        always divide evenly across contributors) — that dust goes to
+        Integer division, in units, leaves a small remainder (the reward
+        doesn't always divide evenly across contributors) — that dust goes to
         whichever address contributed the most shares, a simple
         deterministic tie-break rather than trying to split fractional
         units perfectly."""
         if not shares:
             raise ValueError("build_pool_block requires a non-empty shares tally")
         included = self._select_includable(max_transactions)
-        total_fees = sum(t.fee for t in included)
-        total_reward = self.reward_at_height(self.latest_block.index + 1) + total_fees
+        total_u = to_units(self.reward_at_height(self.latest_block.index + 1)) + sum(to_units(t.fee) for t in included)
         total_shares = sum(shares.values())
         reward_txs = []
-        distributed = 0
+        distributed_u = 0
         for address, count in shares.items():
-            cut = (total_reward * count) // total_shares if total_shares else 0
-            if cut > 0:
-                reward_txs.append(Transaction(sender="0", recipient=address, amount=cut, fee=0))
-                distributed += cut
-        remainder = total_reward - distributed
-        if remainder > 0:
+            cut_u = (total_u * count) // total_shares if total_shares else 0
+            if cut_u > 0:
+                reward_txs.append(Transaction(sender="0", recipient=address, amount=to_coins(cut_u), fee=0))
+                distributed_u += cut_u
+        remainder_u = total_u - distributed_u
+        if remainder_u > 0:
             top_address = max(sorted(shares.keys()), key=lambda a: shares[a])
             # top_address may already have a reward_tx above — a second
             # small coinbase tx to the same address is completely valid,
             # nothing requires coinbase recipients to be unique.
-            reward_txs.append(Transaction(sender="0", recipient=top_address, amount=remainder, fee=0))
+            reward_txs.append(Transaction(sender="0", recipient=top_address, amount=to_coins(remainder_u), fee=0))
         return Block(
             index=self.latest_block.index + 1,
             transactions=reward_txs + included,
@@ -1232,7 +1251,7 @@ class Blockchain:
         N addresses each holding 1/N of a balance have exactly the same
         combined chance as one address holding all of it. That's what
         makes stake weight Sybil-resistant the same way hashpower is."""
-        return int(self.get_balance(address, chain=chain))
+        return self.get_balance_units(address, chain=chain) // UNITS_PER_COIN
 
     def build_stake_block(self, staker_address, max_transactions=50):
         """A PoS 'block template' — everything try_stake needs except
@@ -1244,9 +1263,9 @@ class Blockchain:
         if weight < 1:
             raise ValueError(f"{staker_address} has no stakeable balance (needs at least 1 whole O-Coin)")
         included = self._select_includable(max_transactions)
-        total_fees = sum(t.fee for t in included)
         stake_reward = round(self.reward_at_height(self.latest_block.index + 1) * self.POS_REWARD_FRACTION, 6)
-        reward_tx = Transaction(sender="0", recipient=staker_address, amount=stake_reward + total_fees, fee=0)
+        total_u = to_units(stake_reward) + sum(to_units(t.fee) for t in included)
+        reward_tx = Transaction(sender="0", recipient=staker_address, amount=to_coins(total_u), fee=0)
         return Block(
             index=self.latest_block.index + 1,
             transactions=[reward_tx] + included,
@@ -1308,24 +1327,63 @@ class Blockchain:
         if kernel_int >= block.target * weight:
             raise ValueError("Stake kernel hash does not meet the PoS difficulty target for this staker's weight")
 
-    def _check_block_balances(self, transactions, balances, asset_supply):
+    def _check_block_balances(self, transactions, balances, asset_supply, height):
         """Applies a block's transactions IN ORDER to the passed-in dicts
         (the caller's throwaway copies) and raises ValueError the moment a
         signed transaction takes any balance it debits below zero. Shared by
         accept_block and _walk_chain so a block and a whole chain are judged
         by the same rule. Coinbase entries are applied too (a miner may
         spend its own reward later in the same block) but never judged:
-        they debit nothing."""
+        they debit nothing. Balances are whole units, so "below zero" is
+        exact -- no tolerance for rounding, because there is none."""
         for tx in transactions:
             if tx.op is not None:
                 self._validate_op(tx)
-            debited_keys = self._apply_transaction_to_balance_dict(balances, tx, asset_supply)
+            self._validate_unit_precision(tx, height)
+            debited_keys = self._apply_transaction_to_balance_dict(balances, tx, asset_supply, height=height)
             if tx.sender == "0":
                 continue
             for key in debited_keys:
-                if balances.get(key, 0) < -self.BALANCE_EPSILON:
+                if balances.get(key, 0) < 0:
                     addr, asset = key
                     raise ValueError(f"Block contains a transaction that would drive {addr}'s {asset} balance negative")
+
+    @classmethod
+    def _validate_unit_precision(cls, tx, height):
+        """From INTEGER_UNITS_ACTIVATION_HEIGHT on, every quantity a signed
+        transaction carries must be a whole number of units (at most 8
+        decimal places), so what the sender signed is exactly what moves.
+        Before it, a finer amount was simply rounded to the nearest unit.
+        Coinbase entries are exempt: the node computes them, and
+        _check_coinbase holds their sum exact in units instead."""
+        if height < cls.INTEGER_UNITS_ACTIVATION_HEIGHT or tx.sender == "0":
+            return
+        quantities = [("amount", tx.amount), ("fee", tx.fee)]
+        if isinstance(tx.op_data, dict):
+            quantities += [(k, tx.op_data[k]) for k in cls.OP_QUANTITY_FIELDS if k in tx.op_data]
+        for name, value in quantities:
+            if to_coins(to_units(value)) != value:
+                raise ValueError(f"{name} {value!r} has more than 8 decimal places; the smallest amount is 0.00000001")
+
+    def _check_coinbase(self, block, block_subsidy):
+        """The block's coinbase entries must pay the subsidy plus the fees
+        of the transactions it carries, no more and no less. From
+        INTEGER_UNITS_ACTIVATION_HEIGHT on that is an EXACT equality in
+        units; before it, within 1e-6 of a coin, as it always was, because
+        some historical coinbases are float sums like 100.00955500000001."""
+        reward_txs = [tx for tx in block.transactions if tx.sender == "0"]
+        if not reward_txs:
+            raise ValueError("Block has no coinbase transaction")
+        signed = [tx for tx in block.transactions if tx.sender != "0"]
+        if block.index >= self.INTEGER_UNITS_ACTIVATION_HEIGHT:
+            paid = sum(to_units(tx.amount) for tx in reward_txs)
+            owed = to_units(block_subsidy) + sum(to_units(tx.fee) for tx in signed)
+            ok = paid == owed
+        else:
+            expected = block_subsidy + sum(tx.fee for tx in signed)
+            ok = abs(sum(tx.amount for tx in reward_txs) - expected) <= 1e-6
+        if not ok:
+            raise ValueError("Block's coinbase transaction(s) do not sum to the expected reward + collected fees")
 
     @staticmethod
     def _validate_header_fields(block: Block):
@@ -1392,10 +1450,7 @@ class Blockchain:
         # involves float subtraction/addition that isn't guaranteed
         # bit-exactly reversible — real financial code never compares
         # floats for exact equality for the same reason.
-        reward_txs = [tx for tx in block.transactions if tx.sender == "0"]
-        expected_reward = block_subsidy + sum(tx.fee for tx in block.transactions if tx.sender != "0")
-        if not reward_txs or abs(sum(tx.amount for tx in reward_txs) - expected_reward) > 1e-6:
-            raise ValueError("Block's coinbase transaction(s) do not sum to the expected reward + collected fees")
+        self._check_coinbase(block, block_subsidy)
         # Defense in depth against transaction replay (see
         # add_transaction's docstring for the full reasoning) — that
         # check protects the normal mempool path, but a block can also
@@ -1429,14 +1484,14 @@ class Blockchain:
         # In order, on a throwaway copy, so several spends from one sender in
         # one block are checked against each other; self.balances only gets
         # its REAL update below, once, so nothing is ever applied twice.
-        self._check_block_balances(block.transactions, dict(self.balances), dict(self.asset_supply))
+        self._check_block_balances(block.transactions, dict(self.balances), dict(self.asset_supply), block.index)
         self.chain.append(block)
         # O(1) incremental update — the common case, a full rebuild would
         # be wasteful here since only this one block's worth of
         # transactions actually changed anything (see _rebuild_balance_index
         # for the wholesale-replacement counterpart to this).
         for tx in block.transactions:
-            self._apply_transaction_to_balances(tx)
+            self._apply_transaction_to_balances(tx, block.index)
         # Remove any mempool transactions that made it into this block —
         # by hash, so this works regardless of which miner/node actually
         # produced the block.
@@ -1501,7 +1556,7 @@ class Blockchain:
             raise ValueError("Chain does not start from this network's genesis block")
         balances, supply = {}, {}
         for tx in chain[0].transactions:
-            self._apply_transaction_to_balance_dict(balances, tx, supply)
+            self._apply_transaction_to_balance_dict(balances, tx, supply, height=0)
         pow_target, pos_target = self.INITIAL_TARGET, self._initial_pos_target()
         pow_times, pos_times = [chain[0].timestamp], []
         confirmed = set()
@@ -1518,7 +1573,7 @@ class Blockchain:
             if block.staker_address is not None:
                 if block.target != pos_target:
                     raise ValueError(f"Block {i} carries a PoS target the retarget rules do not give")
-                weight = int(balances.get((block.staker_address, "OCN"), 0))
+                weight = balances.get((block.staker_address, "OCN"), 0) // UNITS_PER_COIN
                 if weight < 1:
                     raise ValueError(f"Block {i} staker has no stakeable balance")
                 if int(block.compute_stake_kernel_hash(), 16) >= block.target * weight:
@@ -1537,10 +1592,7 @@ class Blockchain:
             for tx in block.transactions:
                 if not tx.is_valid():
                     raise ValueError(f"Block {i} contains an invalid transaction")
-            reward_txs = [tx for tx in block.transactions if tx.sender == "0"]
-            expected_reward = block_subsidy + sum(tx.fee for tx in block.transactions if tx.sender != "0")
-            if not reward_txs or abs(sum(tx.amount for tx in reward_txs) - expected_reward) > 1e-6:
-                raise ValueError(f"Block {i} coinbase does not sum to the reward plus fees")
+            self._check_coinbase(block, block_subsidy)
             # Same replay guard as accept_block, re-checked independently.
             signed_hashes = [tx.hash() for tx in block.transactions if tx.sender != "0"]
             if len(signed_hashes) != len(set(signed_hashes)) or any(h in confirmed for h in signed_hashes):
@@ -1550,7 +1602,7 @@ class Blockchain:
             # Checked on a copy; the running state takes the block only once
             # it has passed.
             scratch_balances, scratch_supply = dict(balances), dict(supply)
-            self._check_block_balances(block.transactions, scratch_balances, scratch_supply)
+            self._check_block_balances(block.transactions, scratch_balances, scratch_supply, block.index)
             balances, supply = scratch_balances, scratch_supply
             confirmed.update(signed_hashes)
             prev_hash = block_hash

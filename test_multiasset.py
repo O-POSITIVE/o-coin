@@ -12,7 +12,7 @@ import os
 
 from dotenv import load_dotenv
 
-from blockchain import Block, Blockchain
+from blockchain import Block, Blockchain, to_units
 from transaction import Transaction
 from wallet import Wallet
 
@@ -33,14 +33,17 @@ def old_style_signing_string(tx):
 def old_style_get_balance(chain, address):
     """Ground truth: the EXACT pre-A3 full-scan loop, hand-copied here so
     Scenario 1 has an oracle that couldn't have inherited any bug from the
-    new _apply_transaction_to_balance_dict it's checking against."""
+    new _apply_transaction_to_balance_dict it's checking against. Counted
+    in whole units since 2026-09-30, like the ledger: a float running sum
+    at the 5-billion-coin premine's size carried errors of a millionth of a
+    coin, which is the drift the units ledger exists to remove."""
     balance = 0
     for block in chain:
         for tx in block.transactions:
             if tx.sender == address:
-                balance -= tx.total_cost()
+                balance -= to_units(tx.amount) + to_units(tx.fee)
             if tx.recipient == address:
-                balance += tx.amount
+                balance += to_units(tx.amount)
     return balance
 
 
@@ -111,7 +114,7 @@ else:
     addresses = {tx.sender for b in prefix for tx in b.transactions} | {tx.recipient for b in prefix for tx in b.transactions}
     addresses.discard("0")
     balance_mismatches = [
-        (addr, old_style_get_balance(prefix, addr), real_chain_obj.get_balance(addr, chain=prefix))
+        (addr, old_style_get_balance(prefix, addr), real_chain_obj.get_balance_units(addr, chain=prefix))
         for addr in addresses
     ]
     balance_mismatches = [m for m in balance_mismatches if m[1] != m[2]]
@@ -144,7 +147,7 @@ assert raised, "op-bearing tx must be rejected by add_transaction before TX_SCHE
 # Simulate a block submitted directly (bypassing add_transaction entirely —
 # the "malformed direct block submission attempting to bypass mempool-level
 # checks" adversarial case) — accept_block must catch it independently.
-bc.balances[(staker.address, "TEST")] = 100  # test-only seed; no mint op exists yet (A4/A5)
+bc.balances[(staker.address, "TEST")] = to_units(100)  # test-only seed; no mint op exists yet (A4/A5)
 reward_amount = bc.reward_at_height(bc.latest_block.index + 1) + op_tx.fee  # must sum correctly or the (unrelated) coinbase-sum check masks the check this scenario actually targets
 bad_block = Block(
     index=bc.latest_block.index + 1,
@@ -167,7 +170,7 @@ print("\n=== Scenario 4: after activation, transfer_asset moves the named asset 
 bc2 = Blockchain()
 bc2.TX_SCHEMA_ACTIVATION_HEIGHT = 0  # test-only override — real deployment chooses this deliberately, see blockchain.py's comment
 bc2.mine_block(staker.address)  # gives staker some real OCN to pay the fee with
-bc2.balances[(staker.address, "TEST")] = 100  # test-only seed
+bc2.balances[(staker.address, "TEST")] = to_units(100)  # test-only seed
 transfer = Transaction(staker.address, other.address, 30, op="transfer_asset", op_data={"asset_id": "TEST"})
 transfer.sign(staker)
 bc2.add_transaction(transfer)
@@ -183,7 +186,7 @@ print("\n=== Scenario 5: insufficient asset balance is rejected at BOTH mempool 
 bc3 = Blockchain()
 bc3.TX_SCHEMA_ACTIVATION_HEIGHT = 0
 bc3.mine_block(staker.address)
-bc3.balances[(staker.address, "TEST")] = 10
+bc3.balances[(staker.address, "TEST")] = to_units(10)
 overspend = Transaction(staker.address, other.address, 9999, op="transfer_asset", op_data={"asset_id": "TEST"})
 overspend.sign(staker)
 try:

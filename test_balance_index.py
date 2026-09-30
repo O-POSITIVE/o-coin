@@ -14,7 +14,7 @@ import os
 
 from dotenv import load_dotenv
 
-from blockchain import Block, Blockchain
+from blockchain import Block, Blockchain, to_units
 
 load_dotenv()
 
@@ -108,8 +108,10 @@ from transaction import Transaction  # noqa: E402
 pending_tx = Transaction(sender="payer", recipient="payee", amount=10, fee=0.01, timestamp=0)
 bc2.mempool.append(pending_tx)
 with_pending = bc2.get_balance("payer", include_pending=True)
-assert with_pending == confirmed - pending_tx.total_cost(), (
-    f"expected {confirmed - pending_tx.total_cost()}, got {with_pending}"
+# Compared in units: the ledger is exact, a float subtraction here is not.
+expected_u = bc2.get_balance_units("payer") - to_units(pending_tx.amount) - to_units(pending_tx.fee)
+assert bc2.get_balance_units("payer", include_pending=True) == expected_u, (
+    f"expected {expected_u} units, got {bc2.get_balance_units('payer', include_pending=True)}"
 )
 assert bc2.get_balance("payer") == confirmed, "confirmed (non-pending) balance must be unaffected by mempool contents"
 print(f"  confirmed={confirmed}, with_pending={with_pending} (delta = -{pending_tx.total_cost()}) — correct")

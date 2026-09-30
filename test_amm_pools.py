@@ -10,7 +10,7 @@ that, since pool state is entirely derived from balances/asset_supply, the
 same way A1's balance index derives everything from transaction history).
 Flagged here, not silently dropped.
 """
-from blockchain import Block, Blockchain, proof_of_work
+from blockchain import Block, Blockchain, proof_of_work, to_units
 from transaction import Transaction
 from wallet import Wallet
 
@@ -33,7 +33,7 @@ def give_asset(bc, address, asset_id, amount):
     from genesis) — don't call is_chain_valid on a chain seeded this way;
     see Scenario 8 for a from-scratch-derivable alternative."""
     key = (address, asset_id)
-    bc.balances[key] = bc.balances.get(key, 0) + amount
+    bc.balances[key] = bc.balances.get(key, 0) + to_units(amount)  # the ledger counts units
 
 
 print('=== Scenario 1: pool/LP addresses are canonical regardless of asset order ===')
@@ -57,7 +57,7 @@ status = bc.pool_status(pool_key)
 assert status["reserve_a"] == 40 and status["reserve_b"] == 90, status
 expected_lp = round((40 * 90) ** 0.5, 6)
 assert bc.get_balance(lp1.address, asset_id=status["lp_asset"]) == expected_lp
-assert bc.asset_supply.get(status["lp_asset"]) == expected_lp
+assert bc.asset_supply.get(status["lp_asset"]) == to_units(expected_lp)
 print(f"  reserves after first add: {status['reserve_a']} OCN / {status['reserve_b']} TEST, LP minted: {expected_lp}")
 
 

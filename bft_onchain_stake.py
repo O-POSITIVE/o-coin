@@ -34,7 +34,7 @@ here, and no live PoW/PoS behavior changes as a result of this file
 existing.
 """
 
-from blockchain import Blockchain
+from blockchain import Blockchain, to_coins
 from bft_accountability import SlashingRegistry
 
 
@@ -84,7 +84,7 @@ def slash_on_chain(evidence, bonded_committee: OnChainBondedCommittee, blockchai
         if amount <= 0:
             continue
         blockchain.balances[key] = 0
-        burned[idx] = amount
+        burned[idx] = to_coins(amount)  # the ledger counts units; callers speak coins
     return burned
 
 

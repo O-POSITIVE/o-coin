@@ -5,7 +5,7 @@ key, because O-Coin blocks (PoW or PoS) were never signed by their producer
 in the first place. Same no-networking, direct-object style as the other
 test_*.py files in this repo.
 """
-from blockchain import Block, Blockchain, proof_of_work
+from blockchain import Block, Blockchain, proof_of_work, to_units
 from transaction import Transaction
 from wallet import Wallet
 
@@ -29,15 +29,16 @@ print('\n=== Scenario 2: first depositor mints stOCN 1:1 (empty-pool bootstrap r
 bc = fresh_active_chain()
 depositor = Wallet()
 bc.mine_block(depositor.address)  # gives depositor real OCN to deposit
-before = bc.get_balance(depositor.address)
+before_u = bc.get_balance_units(depositor.address)
 deposit = Transaction(depositor.address, Blockchain.STAKE_POOL_ADDRESS, 40, op="stake_pool_deposit")
 deposit.sign(depositor)
 bc.add_transaction(deposit)
 bc.mine_block("miner-x")
 assert bc.get_balance(depositor.address, asset_id="stOCN") == 40, bc.get_balance(depositor.address, asset_id="stOCN")
 assert bc.get_balance(Blockchain.STAKE_POOL_ADDRESS) == 40
-assert bc.asset_supply.get("stOCN") == 40
-assert bc.get_balance(depositor.address) == before - deposit.total_cost()
+assert bc.asset_supply.get("stOCN") == to_units(40)
+# In units: exact, where a float before - 40.01 would carry a speck of rounding.
+assert bc.get_balance_units(depositor.address) == before_u - to_units(deposit.amount) - to_units(deposit.fee)
 print(f"  deposited 40 OCN -> minted 40 stOCN (rate 1.0), pool OCN balance = {bc.get_balance(Blockchain.STAKE_POOL_ADDRESS)}")
 
 
@@ -110,15 +111,15 @@ dep.sign(w)
 bc3.add_transaction(dep)
 bc3.mine_block("miner-w")
 assert bc3.get_balance(w.address, asset_id="stOCN") == 50
-ocn_before_withdraw = bc3.get_balance(w.address)
+ocn_before_withdraw_u = bc3.get_balance_units(w.address)
 withdraw = Transaction(w.address, w.address, 20, op="stake_pool_withdraw")
 withdraw.sign(w)
 bc3.add_transaction(withdraw)
 bc3.mine_block("miner-w2")
 assert bc3.get_balance(w.address, asset_id="stOCN") == 30, bc3.get_balance(w.address, asset_id="stOCN")
-assert bc3.asset_supply.get("stOCN") == 30
+assert bc3.asset_supply.get("stOCN") == to_units(30)
 assert bc3.get_balance(Blockchain.STAKE_POOL_ADDRESS) == 30
-assert bc3.get_balance(w.address) == ocn_before_withdraw - withdraw.fee + 20, bc3.get_balance(w.address)
+assert bc3.get_balance_units(w.address) == ocn_before_withdraw_u - to_units(withdraw.fee) + to_units(20), bc3.get_balance(w.address)
 print(f"  withdrew 20 stOCN -> 20 OCN back (rate was 1.0), remaining stOCN: {bc3.get_balance(w.address, asset_id='stOCN')}")
 
 
