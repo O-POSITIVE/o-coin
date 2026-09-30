@@ -182,6 +182,9 @@ class Blockchain:
     # already uses to choose what to include. ~25 min of backlog at the ~50-tx,
     # 15s block cadence, so it never bites legitimate use.
     MEMPOOL_MAX = 5000
+    # The release whose consensus rules this code enforces; node.py reports
+    # it in /status. Bump it with every change to what a valid block is.
+    RULES_VERSION = "0.1.0"
     # How far below zero float rounding may leave a balance before a block
     # is refused for overspending it (security review, 2026-09-29). Amounts
     # are floats, and "send the whole balance" can land a hair under zero

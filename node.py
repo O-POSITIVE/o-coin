@@ -294,9 +294,36 @@ def broadcast_block(block: Block):
         threading.Thread(target=_send, daemon=True).start()
 
 
+# What a /status reader needs to tell which code a node runs, without
+# probing its behaviour (2026-09-30: after the security release the only way
+# to know the live node had redeployed was to test a rule it had changed).
+# "rules" is the release whose consensus rules this code enforces -- bump it
+# with every rule change. "commit" is Render's own record of the deployed
+# commit, absent anywhere else.
+NODE_VERSION = {"rules": Blockchain.RULES_VERSION, "commit": (os.getenv("RENDER_GIT_COMMIT") or "")[:7] or None}
+
+_work_cache = {"key": None, "work": 0}
+
+
+def _our_chain_work():
+    """Total work of our chain (Blockchain.chain_work), recomputed only when
+    the chain changes. Caller holds no lock: a torn read just costs one
+    recompute, since the key is checked again on the next call."""
+    chain = blockchain.chain
+    key = (len(chain), id(chain[-1]))
+    if _work_cache["key"] != key:
+        _work_cache["work"] = blockchain.chain_work(chain)
+        _work_cache["key"] = key
+    return _work_cache["work"]
+
+
 @app.route("/status")
 def status():
     return jsonify({
+        "version": NODE_VERSION,
+        # A decimal STRING: it passes 2**53 soon, and a JavaScript reader
+        # would silently round a bare number that large.
+        "chain_work": str(_our_chain_work()),
         "chain_length": len(blockchain.chain),
         "current_target": blockchain.current_target,
         "pos_target": blockchain.pos_target,
@@ -656,22 +683,33 @@ def peer_sync_loop():
     gossip (broadcast_block) is fire-and-forget, so a peer that was
     asleep/restarting when a block was pushed would otherwise stay behind
     until something happened to call /nodes/resolve. This loop closes that
-    gap every 2 minutes, with a cheap /status length check first so the
-    full /chain download (the expensive part, whole chain every time — fine
-    at today's size, revisit with an incremental fetch if the chain gets
-    long) only happens when a peer actually claims a longer chain."""
-    headers = _peer_headers()
+    gap every 2 minutes, with a cheap /status check first so the full
+    /chain download (the expensive part, whole chain every time — fine at
+    today's size, revisit with an incremental fetch if the chain gets long)
+    only happens when a peer actually claims a better chain.
+
+    "Better" is MORE WORK, the same measure replace_chain decides by
+    (2026-09-30). Asking only "is theirs longer?" meant a shorter chain with
+    more work -- the one replace_chain would pick -- was never even fetched
+    by this loop. A peer too old to report chain_work falls back to length.
+    Either way the claim is only a reason to look: replace_chain re-verifies
+    everything before adopting anything."""
     while True:
         time.sleep(120)
         try:
             for peer in list(peers):
                 try:
-                    resp = requests.get(f"{peer}/status", timeout=30)
-                    if resp.json().get("chain_length", 0) > len(blockchain.chain):
+                    info = requests.get(f"{peer}/status", timeout=30).json()
+                    theirs = info.get("chain_work")
+                    if theirs is not None:
+                        better = int(theirs) > _our_chain_work()
+                    else:
+                        better = info.get("chain_length", 0) > len(blockchain.chain)
+                    if better:
                         _resolve_with_peers()
                         break
-                except requests.RequestException:
-                    pass
+                except (requests.RequestException, ValueError, TypeError, AttributeError):
+                    pass  # a peer that is down or answers nonsense is skipped, as before
         except Exception as e:
             print("peer_sync_loop tick failed:", e)
 
