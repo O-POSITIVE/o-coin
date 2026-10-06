@@ -18,8 +18,11 @@ assert int(s["chain_work"]) == node.blockchain.chain_work(node.blockchain.chain)
 print("  ", s["version"], "chain_work", s["chain_work"])
 
 print("\n=== 2: peer sync looks at a peer that claims more work, and only then ===")
+# Borrowed from the node module and given back at the end: unittest runs
+# every test file in ONE process, and test_peer_sync.py needs the real ones.
+_real = (node._sync_from_peer, node.requests.get, node.time.sleep)
 resolves = []
-node._resolve_with_peers = lambda: resolves.append(1)
+node._sync_from_peer = lambda peer, headers, allow_full=False: (resolves.append(1), "kept")[1]
 answer = {}
 
 
@@ -61,11 +64,14 @@ def one_tick(body):
 ours = node._our_chain_work()
 assert one_tick({"chain_work": str(ours + 1), "chain_length": 1}) is True, "more work at the same length: fetch it"
 assert one_tick({"chain_work": str(ours), "chain_length": 10 ** 6}) is False, "longer but no more work: leave it"
-assert one_tick({"chain_length": 5}) is True, "a peer too old to report work falls back to length"
+# 2026-10-06: no length fallback. An old peer was fetched whenever merely
+# LONGER, and a forked backup on old rules was pulled in full every two
+# minutes and refused every time (test_peer_sync.py has the rest).
+assert one_tick({"chain_length": 5}) is False, "a peer too old to report work is skipped"
 assert one_tick({"chain_length": 1}) is False
 assert one_tick(ValueError("an HTML error page")) is False, "a junk answer is skipped"
 assert one_tick({"chain_work": "not-a-number"}) is False
-print("  more work -> fetched; longer-but-lighter -> ignored; old peers -> by length; junk -> skipped")
+print("  more work -> fetched; longer-but-lighter -> ignored; old peers -> skipped; junk -> skipped")
 
 print("\n=== 3: a stored chain that fails validation stops the node; it never restarts from genesis ===")
 from blockchain import Block  # noqa: E402
@@ -104,5 +110,8 @@ assert len(node.blockchain.chain) == 1, "and nothing was adopted"
 stored[:] = []
 node.load_chain()
 print("  an empty table (a brand-new node) still starts fresh")
+
+node._sync_from_peer, node.requests.get, node.time.sleep = _real
+node.blockchain = node.Blockchain()
 
 print("\n=== ALL NODE STATUS/SYNC SCENARIOS PASSED ===")

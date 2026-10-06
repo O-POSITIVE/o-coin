@@ -153,6 +153,8 @@ PUBLIC_ENDPOINTS = {
     "list_pools", "amm_pool_status",
     "blocks_page", "block_detail", "address_transactions",
     "stake_pool_history", "amm_pool_history",
+    # incremental sync (2026-10-06): slices of what get_chain already serves whole
+    "chain_hashes", "chain_blocks",
     # D1 — pool mining (mirrors the already-public solo-mining endpoints)
     "pool_template", "pool_submit_share",
     # D2 — gossip/write, each rate-limited + fully re-validated
@@ -203,36 +205,146 @@ def init_db():
 
 def save_block(block: Block):
     """One INSERT per block — O(1) regardless of chain length, unlike
-    rewriting a single ever-growing JSON file on every block."""
-    conn = get_pg()
+    rewriting a single ever-growing JSON file on every block.
+
+    A failed save no longer escapes (2026-10-06). The block is already part
+    of the chain in memory when this runs; a database hiccup on 2026-09-30
+    left blocks #14,828-#14,829 accepted but never stored, and since a node
+    refuses to start on a stored chain that fails validation, the next
+    restart would have kept the main node down. A failure now flags the
+    persistence check, which writes the missing rows from memory."""
     try:
-        cur = conn.cursor()
-        cur.execute(
-            f"INSERT INTO {BLOCKS_TABLE} (idx, data) VALUES (%s, %s) "
-            "ON CONFLICT (idx) DO UPDATE SET data = EXCLUDED.data",
-            (block.index, psycopg2.extras.Json(block.to_dict())),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+        conn = get_pg()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                f"INSERT INTO {BLOCKS_TABLE} (idx, data) VALUES (%s, %s) "
+                "ON CONFLICT (idx) DO UPDATE SET data = EXCLUDED.data",
+                (block.index, psycopg2.extras.Json(block.to_dict())),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"Could not save block #{block.index} ({e}); the persistence check will store it")
+        _persist_needed.set()
 
 
-def save_full_chain():
-    """Used only after a chain replacement (peer sync adopted a longer
-    chain) — that's the one case where more than one block changes at
-    once, so a bulk rewrite is actually the right tool, not the default."""
-    conn = get_pg()
+# ── Persistence check (2026-10-06) ──────────────────────────────────────────
+# The stored chain must always be the chain in memory: a node restarts from
+# the table, and refuses to start if what is there does not validate. Every
+# PERSIST_CHECK_S the table is counted -- one tiny query when it is healthy --
+# and any block it is missing is written from memory, any row past the tip
+# removed. Every PERSIST_DEEP_EVERY passes, and soon after any failed save,
+# the check also compares the blocks themselves over the last PERSIST_TAIL
+# (where a reorg can change history, see Blockchain.CHECKPOINT_DEPTH), or
+# from wherever a failed rewrite started, and rewrites any that differ.
+#
+# It runs under chain_lock, like every save: a check working from a copy
+# could write a block that a reorg replaced a moment earlier.
+PERSIST_CHECK_S = 600
+PERSIST_DEEP_EVERY = 6                           # the deep pass: hourly
+PERSIST_TAIL = 32
+_persist_needed = threading.Event()
+_persist_from = [None]   # the lowest index a failed rewrite left unchecked
+
+
+def persistence_check(deep=False):
+    """Make the table match the chain in memory. Returns how many rows it
+    wrote or removed."""
+    with chain_lock:
+        chain = blockchain.chain
+        tip = len(chain) - 1                     # genesis (0) is never stored (load_chain)
+        conn = get_pg()
+        try:
+            cur = conn.cursor()
+            cur.execute(f"SELECT count(*), coalesce(max(idx), 0) FROM {BLOCKS_TABLE} WHERE idx > 0")
+            count, top = cur.fetchone()
+            fix = []
+            if count != tip or top != tip:
+                cur.execute(f"SELECT idx FROM {BLOCKS_TABLE} WHERE idx > 0 AND idx <= %s", (tip,))
+                stored = {r[0] for r in cur.fetchall()}
+                fix = [b for b in chain[1:] if b.index not in stored]
+            if deep:
+                start = max(1, tip + 1 - PERSIST_TAIL)
+                if _persist_from[0] is not None:
+                    start = max(1, min(start, _persist_from[0]))
+                cur.execute(f"SELECT idx, data FROM {BLOCKS_TABLE} WHERE idx >= %s AND idx <= %s", (start, tip))
+                stored = {i: d if isinstance(d, dict) else json.loads(d) for i, d in cur.fetchall()}
+                fix += [b for b in chain[start:] if b.index in stored
+                        and Block.from_dict(stored[b.index]).compute_hash() != b.compute_hash()]
+            dropped = 0
+            if top > tip:
+                # A heavier chain can be SHORTER: rows past its tip are the
+                # old fork's, and load_chain would refuse them.
+                cur.execute(f"DELETE FROM {BLOCKS_TABLE} WHERE idx > %s", (tip,))
+                dropped = top - tip
+            if fix:
+                psycopg2.extras.execute_batch(
+                    cur,
+                    f"INSERT INTO {BLOCKS_TABLE} (idx, data) VALUES (%s, %s) "
+                    "ON CONFLICT (idx) DO UPDATE SET data = EXCLUDED.data",
+                    [(b.index, psycopg2.extras.Json(b.to_dict())) for b in fix],
+                )
+            if fix or dropped:
+                conn.commit()
+                done = []
+                if fix:
+                    done.append(f"stored {len(fix)} block(s) the table was missing or had stale "
+                                f"(#{min(b.index for b in fix)}-#{max(b.index for b in fix)})")
+                if dropped:
+                    done.append(f"removed the rows past #{tip}")
+                print("Persistence check: " + "; ".join(done))
+            if deep:
+                _persist_from[0] = None
+            return len(fix) + dropped
+        finally:
+            conn.close()
+
+
+def persistence_loop():
+    passes = 0
+    while True:
+        flagged = _persist_needed.wait(PERSIST_CHECK_S)
+        _persist_needed.clear()
+        if flagged:
+            time.sleep(30)                       # a database hiccup is usually brief
+        passes += 1
+        try:
+            persistence_check(deep=flagged or passes % PERSIST_DEEP_EVERY == 0)
+        except Exception as e:
+            print("persistence check failed (will retry):", e)
+            _persist_needed.set()
+            time.sleep(60)
+
+
+def save_full_chain(start=0):
+    """Used only after a chain replacement (peer sync adopted a chain with
+    more work) — that's the one case where more than one block changes at
+    once, so a bulk rewrite is actually the right tool, not the default.
+    Rewrites from `start`: incremental sync knows the last block both chains
+    share, and everything before it is already stored (2026-10-06; it used
+    to delete and re-insert all ~16,500 blocks for a one-block reorg).
+    One transaction, so a failure leaves the old rows; like save_block, a
+    failure flags the persistence check -- to compare from `start` -- instead
+    of escaping."""
     try:
-        cur = conn.cursor()
-        cur.execute(f"DELETE FROM {BLOCKS_TABLE}")
-        psycopg2.extras.execute_batch(
-            cur,
-            f"INSERT INTO {BLOCKS_TABLE} (idx, data) VALUES (%s, %s)",
-            [(b.index, psycopg2.extras.Json(b.to_dict())) for b in blockchain.chain],
-        )
-        conn.commit()
-    finally:
-        conn.close()
+        conn = get_pg()
+        try:
+            cur = conn.cursor()
+            cur.execute(f"DELETE FROM {BLOCKS_TABLE} WHERE idx >= %s", (start,))
+            psycopg2.extras.execute_batch(
+                cur,
+                f"INSERT INTO {BLOCKS_TABLE} (idx, data) VALUES (%s, %s)",
+                [(b.index, psycopg2.extras.Json(b.to_dict())) for b in blockchain.chain[start:]],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"Could not rewrite the stored chain from #{start} ({e}); the persistence check will")
+        _persist_from[0] = start if _persist_from[0] is None else min(_persist_from[0], start)
+        _persist_needed.set()
 
 
 def load_chain():
@@ -366,6 +478,57 @@ def get_chain():
             _chain_cache["body"] = json.dumps({"length": n, "chain": [b.to_dict() for b in blockchain.chain]})
         body = _chain_cache["body"]
     return app.response_class(body, mimetype="application/json")
+
+
+# ── Incremental sync (2026-10-06) ───────────────────────────────────────────
+# Peer sync used to download a peer's WHOLE chain (/chain: 10.6 MB raw, 1.7 MB
+# compressed at 16,491 blocks) every time the peer looked ahead. With the
+# primary and backup on a lasting fork that was every two minutes, over
+# public URLs: 7.46 GB of the workspace's 10.59 GB of billed bandwidth in the
+# first six days of October. Now a node asks for the last few block hashes,
+# finds the last block both chains share, and downloads only what follows.
+# A fork deeper than SYNC_HASH_WINDOW is past the reorg checkpoint
+# (Blockchain.CHECKPOINT_DEPTH), which replace_chain refuses anyway -- so
+# nothing is downloaded for it. Fork choice itself is untouched: the result
+# still goes through replace_chain, validated from genesis.
+SYNC_HASH_WINDOW = 64
+SYNC_PAGE = 500
+
+
+def _sync_page_args():
+    start = max(0, int(request.args.get("start", 0)))
+    limit = max(1, min(int(request.args.get("limit", SYNC_PAGE)), SYNC_PAGE))
+    return start, limit
+
+
+@app.route("/chain/hashes")
+@limiter.limit("120 per minute")
+def chain_hashes():
+    """Block hashes from `start` (at most SYNC_PAGE), with the chain's length
+    and work: what a peer compares with its own chain to find where the two
+    agree, before fetching only the blocks after that point."""
+    try:
+        start, limit = _sync_page_args()
+    except ValueError:
+        return jsonify({"status": "failed", "reason": "start/limit must be integers"}), 400
+    with chain_lock:
+        n = len(blockchain.chain)
+        hashes = [b.compute_hash() for b in blockchain.chain[start:start + limit]]
+    return jsonify({"length": n, "start": start, "hashes": hashes, "chain_work": str(_our_chain_work())})
+
+
+@app.route("/chain/blocks")
+@limiter.limit("120 per minute")
+def chain_blocks():
+    """Full blocks from `start` (at most SYNC_PAGE): the ones a peer is missing."""
+    try:
+        start, limit = _sync_page_args()
+    except ValueError:
+        return jsonify({"status": "failed", "reason": "start/limit must be integers"}), 400
+    with chain_lock:
+        n = len(blockchain.chain)
+        blocks = [b.to_dict() for b in blockchain.chain[start:start + limit]]
+    return jsonify({"length": n, "start": start, "blocks": blocks})
 
 
 @app.route("/balance/<address>")
@@ -635,93 +798,163 @@ def register_nodes():
     return jsonify({"status": "ok", "peers": sorted(peers)})
 
 
-def _resolve_with_peers():
-    """The real consensus algorithm: ask every known peer for their
-    chain, and adopt the one with the most work that's actually valid — this is
-    what lets two nodes that mined different blocks around the same time
-    (a natural, expected occurrence, not an error) converge back onto a
-    single agreed history once one side pulls further ahead."""
-    replaced = False
-    headers = _peer_headers()
-    # The download happens OUTSIDE chain_lock; only the compare-and-swap is
-    # inside it (security review, 2026-09-29). Holding the lock across a
-    # 60-second fetch let one slow or hostile registered peer freeze mining,
-    # transaction submission and gossip for as long as it cared to stall.
-    for peer in list(peers):
+def _fetch_json(url, headers, timeout):
+    resp = requests.get(url, headers=headers, timeout=timeout)
+    if resp.status_code != 200:
+        raise LookupError(f"{resp.status_code}")
+    data = resp.json()
+    if not isinstance(data, dict):
+        raise ValueError("not a JSON object")
+    return data
+
+
+def _full_chain_candidate(peer, headers):
+    """The old way: a peer's ENTIRE chain. Kept only for a peer too old to
+    serve /chain/hashes, and only at startup (allow_full) -- never from the
+    two-minute loop, gossip, or the public /nodes/resolve, so nobody can make
+    this node pull megabytes on demand."""
+    # 60s: a cloud-hosted peer serving every block (plus a cold start) can
+    # legitimately take longer than a quick status ping.
+    data = _fetch_json(f"{peer}/chain", headers, timeout=60)
+    if "chain" not in data:
+        raise ValueError("no chain in the answer")
+    return [Block.from_dict(b) for b in data["chain"]]
+
+
+def _sync_from_peer(peer, headers, allow_full=False):
+    """Adopt a peer's chain if it has more work, downloading only the blocks
+    after the last one both chains share (see SYNC_HASH_WINDOW). Returns one of
+      "replaced"  -- adopted
+      "kept"      -- theirs has no more work, or forks past our checkpoint;
+                     nothing (or only hashes) downloaded
+      "rejected"  -- claimed more work, but replace_chain refused it
+      "old-peer"  -- no /chain/hashes (older code) and allow_full is off
+      "unreachable"
+    Any peer answer that is not what it should be is skipped, never fatal: a
+    node always has its own persisted chain to fall back on."""
+    try:
+        with chain_lock:
+            ours_len = len(blockchain.chain)
         try:
-            # 60s, not the 2-5s the gossip paths use: /chain ships the
-            # peer's ENTIRE chain, and a cloud-hosted peer serving
-            # hundreds of blocks (plus a possible cold start) can
-            # legitimately take longer than a quick status ping. This
-            # call only happens on startup catch-up, explicit
-            # /nodes/resolve, and peer_sync_loop's already-throttled
-            # once-per-2-min check — never in a request hot path.
-            resp = requests.get(f"{peer}/chain", headers=headers, timeout=60)
-            # A peer that returns anything other than a real chain payload
-            # (a 401 from a secret mismatch, a 5xx, a cold-start HTML page,
-            # malformed JSON) must be SKIPPED, never fatal. Previously
-            # `data["chain"]` on a `{"reason":"Unauthorized"}` body raised
-            # KeyError straight out of the startup call in __main__ and
-            # crashed the whole node on boot — exactly the kind of thing
-            # that turns one peer being briefly down or out-of-sync into a
-            # total outage. A node always has its own persisted chain to
-            # fall back on, so skipping a bad peer is safe.
-            if resp.status_code != 200:
-                print(f"Peer {peer} returned {resp.status_code} for /chain; skipping")
-                continue
-            data = resp.json()
-            if not isinstance(data, dict) or "chain" not in data:
-                print(f"Peer {peer} /chain response has no chain; skipping")
-                continue
-            candidate = [Block.from_dict(b) for b in data["chain"]]
+            first = _fetch_json(f"{peer}/chain/hashes?start=0&limit=1", headers, timeout=15)
+        except LookupError as e:
+            if str(e) != "404":
+                return "unreachable"
+            if not allow_full:
+                return "old-peer"
+            candidate = _full_chain_candidate(peer, headers)
             with chain_lock:
                 if blockchain.replace_chain(candidate):
-                    replaced = True
                     save_full_chain()
-        except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError) as e:
-            print(f"Could not sync from peer {peer}: {e}")
+                    return "replaced"
+            return "rejected"
+        theirs_len, theirs_work = int(first["length"]), int(first["chain_work"])
+        if theirs_work <= _our_chain_work():
+            return "kept"
+        # Where do the two chains last agree? Look back from the shorter tip.
+        start = max(0, min(ours_len, theirs_len) - SYNC_HASH_WINDOW)
+        page = _fetch_json(f"{peer}/chain/hashes?start={start}&limit={SYNC_HASH_WINDOW}", headers, timeout=15)
+        hashes = page["hashes"]
+        with chain_lock:
+            common = None
+            for i in range(min(len(hashes), len(blockchain.chain) - start) - 1, -1, -1):
+                if blockchain.chain[start + i].compute_hash() == hashes[i]:
+                    common = start + i
+                    break
+        if common is None:
+            # Different genesis, or a fork deeper than the window: past our
+            # checkpoint, which replace_chain refuses. Nothing to download.
+            return "kept"
+        blocks = []
+        at = common + 1
+        while at < theirs_len:
+            got = _fetch_json(f"{peer}/chain/blocks?start={at}&limit={SYNC_PAGE}", headers, timeout=30)["blocks"]
+            if not got:
+                break
+            blocks.extend(Block.from_dict(b) for b in got)
+            at += len(got)
+        with chain_lock:
+            # Our chain may have moved while we downloaded; the prefix must
+            # still be the one the peer's blocks build on.
+            if len(blockchain.chain) <= common or blockchain.chain[common].compute_hash() != hashes[common - start]:
+                return "kept"
+            if blockchain.replace_chain(list(blockchain.chain[:common + 1]) + blocks):
+                save_full_chain(common + 1)      # everything up to the shared block is stored
+                return "replaced"
+        return "rejected"
+    except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError, LookupError) as e:
+        print(f"Could not sync from peer {peer}: {e}")
+        return "unreachable"
+
+
+def _resolve_with_peers(allow_full=False):
+    """The real consensus algorithm: compare with every known peer and adopt
+    the valid chain with the most work -- what lets two nodes that mined
+    different blocks around the same time (natural, not an error) converge
+    once one side pulls ahead. Downloads happen OUTSIDE chain_lock; only the
+    compare-and-swap is inside it (security review, 2026-09-29: holding the
+    lock across a slow fetch let one peer freeze mining and gossip)."""
+    replaced = False
+    headers = _peer_headers()
+    for peer in list(peers):
+        if _sync_from_peer(peer, headers, allow_full=allow_full) == "replaced":
+            replaced = True
     return replaced
 
 
 @app.route("/nodes/resolve")
-@limiter.limit("6 per minute")  # D2: expensive (fetches every peer's full chain); tight cap
+@limiter.limit("6 per minute")  # D2: public; cheap now (hashes, then only missing blocks)
 def resolve_conflicts():
     replaced = _resolve_with_peers()
     return jsonify({"status": "ok", "replaced": replaced, "chain_length": len(blockchain.chain)})
 
 
+# A peer whose heavier chain we had to refuse is asked again after a growing
+# pause (4, 8, 16 ... 60 minutes), not every two minutes: a lasting fork that
+# replace_chain will never accept is not worth re-downloading on a timer.
+SYNC_BACKOFF_MAX_S = 3600
+_peer_retry_at = {}
+_peer_backoff_s = {}
+
+
 def peer_sync_loop():
-    """Self-healing reconciliation for env-seeded peers (OCOIN_PEERS) —
+    """Self-healing reconciliation for env-seeded peers (OCOIN_PEERS) --
     gossip (broadcast_block) is fire-and-forget, so a peer that was
     asleep/restarting when a block was pushed would otherwise stay behind
-    until something happened to call /nodes/resolve. This loop closes that
-    gap every 2 minutes, with a cheap /status check first so the full
-    /chain download (the expensive part, whole chain every time — fine at
-    today's size, revisit with an incremental fetch if the chain gets long)
-    only happens when a peer actually claims a better chain.
+    until something called /nodes/resolve. Every 2 minutes a cheap /status
+    check first; a sync only when the peer claims MORE WORK, the measure
+    replace_chain decides by (2026-09-30).
 
-    "Better" is MORE WORK, the same measure replace_chain decides by
-    (2026-09-30). Asking only "is theirs longer?" meant a shorter chain with
-    more work -- the one replace_chain would pick -- was never even fetched
-    by this loop. A peer too old to report chain_work falls back to length.
-    Either way the claim is only a reason to look: replace_chain re-verifies
-    everything before adopting anything."""
+    No length fallback any more (2026-10-06): a peer too old to report its
+    work used to be fetched whenever it was merely LONGER -- with the backup
+    node on old rules and forked, that pulled its whole chain every two
+    minutes, and it was refused every time. Such a peer is skipped until it
+    runs current code."""
     while True:
         time.sleep(120)
         try:
             for peer in list(peers):
+                now = time.time()
+                if now < _peer_retry_at.get(peer, 0):
+                    continue
                 try:
                     info = requests.get(f"{peer}/status", timeout=30).json()
                     theirs = info.get("chain_work")
-                    if theirs is not None:
-                        better = int(theirs) > _our_chain_work()
-                    else:
-                        better = info.get("chain_length", 0) > len(blockchain.chain)
-                    if better:
-                        _resolve_with_peers()
-                        break
+                    if theirs is None or int(theirs) <= _our_chain_work():
+                        continue
                 except (requests.RequestException, ValueError, TypeError, AttributeError):
-                    pass  # a peer that is down or answers nonsense is skipped, as before
+                    continue  # a peer that is down or answers nonsense is skipped
+                outcome = _sync_from_peer(peer, _peer_headers())
+                if outcome == "rejected":
+                    wait = min(SYNC_BACKOFF_MAX_S, _peer_backoff_s.get(peer, 120) * 2)
+                    _peer_backoff_s[peer] = wait
+                    _peer_retry_at[peer] = time.time() + wait
+                    print(f"Peer {peer}'s chain was refused; asking again in {wait // 60} min")
+                else:
+                    _peer_backoff_s.pop(peer, None)
+                    _peer_retry_at.pop(peer, None)
+                if outcome == "replaced":
+                    break
         except Exception as e:
             print("peer_sync_loop tick failed:", e)
 
@@ -1056,6 +1289,8 @@ if __name__ == "__main__":
     if not re.fullmatch(r"[a-z0-9_]+", BLOCKS_TABLE):
         raise SystemExit(f"OCOIN_BLOCKS_TABLE must be a plain lowercase identifier, got: {BLOCKS_TABLE!r}")
     load_chain()
+    # Keeps the table equal to the chain in memory (see persistence_check).
+    threading.Thread(target=persistence_loop, daemon=True).start()
     # OCOIN_PEERS: comma-separated peer base URLs, seeded at startup —
     # /nodes/register still works but only lives in memory, which on a
     # host that sleeps/redeploys means peers silently un-peer on every
@@ -1076,7 +1311,7 @@ if __name__ == "__main__":
         # deadlock each other on restart. Belt-and-suspenders around the
         # per-peer guards already inside _resolve_with_peers.
         try:
-            if _resolve_with_peers():
+            if _resolve_with_peers(allow_full=True):   # startup: an old peer may still be read in full
                 print(f"Startup resolve adopted a longer peer chain — now at {len(blockchain.chain)} blocks")
         except Exception as e:
             print(f"Startup peer resolve failed (non-fatal, continuing): {e}")

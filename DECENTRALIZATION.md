@@ -89,6 +89,14 @@ so keeping them gated costs participants nothing.
   can now run a node that fully SYNCS from the live network and mine it.*
   (Full `/chain` pagination for very large chains remains a later optimization;
   the cache handles today's scale.)
+  **2026-10-06: peer sync no longer reads `/chain`.** At 16,500 blocks it was
+  10.6 MB raw, and two forked nodes pulled each other's whole chain every two
+  minutes -- most of a month's hosting bandwidth in six days. Sync now reads
+  `/chain/hashes` to find the last block both chains share and fetches only
+  what follows from `/chain/blocks` (both public, paged at 500). A peer whose
+  heavier chain is refused is asked again after 4, 8 ... 60 minutes; a peer
+  too old to report its chain work is read in full only at startup. Fork
+  choice is unchanged: every candidate still goes through `replace_chain`.
   **LIVE + VERIFIED IN PRODUCTION 2026-07-20:** both hosted nodes serve
   `/chain` publicly (200, no secret), heights tracking within ±1. Shipping it
   surfaced a pre-existing latent bug — `_resolve_with_peers` crashed the node

@@ -134,6 +134,7 @@ node — they run heavy work inline and real mining/staking never need them
 |---|---|
 | `GET /status` | Chain length, both difficulty targets, current PoW/PoS rewards, mempool size, peers |
 | `GET /chain` | Full chain, serialized |
+| `GET /chain/hashes?start=&limit=`, `GET /chain/blocks?start=&limit=` | Slices of the chain (at most 500): what peer sync reads to find where two chains agree and fetch only the blocks after it |
 | `GET /balance/<address>` | Confirmed balance |
 | `POST /transactions/new` | Submit a signed transaction |
 | `GET /transactions/pending` | Current mempool |
